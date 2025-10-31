@@ -1,54 +1,64 @@
 export type WbsNode = {
-  id: string          // stable path id: "1", "1.2", "1.2.3"
-  label: string
-  level: number
-  children: WbsNode[]
+  id: string;        // path-like id: "1", "1.2", "1.2.1"
+  label: string;
+  level: number;     // 1 = top-level task under virtual root
+  children: WbsNode[];
+};
+
+function normalizeLines(input: string): string[] {
+  return (input || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\t/g, '  ')         // tabs -> 2 spaces
+    .split('\n')
+    .map(l => l.replace(/\u00A0/g, ' ').replace(/\s+$/,''))
+    .filter(l => l.trim().length > 0);
 }
 
-// Convert an indented outline (tabs or 2 spaces per level) into a tree with stable path IDs.
+/**
+ * Parses an indented outline (2 spaces per level) into a tree.
+ * The returned tree has a virtual root { id: 'root', level: 0 }.
+ * The first real line becomes level=1.
+ */
 export function parseOutline(text: string): WbsNode {
-  const lines = text.split(/\r?\n/).map(l => l.replace(/\s+$/, ''))
-  const items = lines
-    .filter(l => l.trim().length > 0)
-    .map((line) => {
-      const m = line.match(/^(\s*)(.*)$/)!
-      const ws = m[1]
-      const label = m[2].trim()
-      const tabs = (ws.match(/\t/g) || []).length
-      const spaces = ws.replace(/\t/g, '').length
-      const level = tabs + Math.floor(spaces / 2) // 1 tab = 1 level; 2 spaces = 1 level
-      return { label, level }
-    })
+  const lines = normalizeLines(text);
+  const root: WbsNode = { id: 'root', label: 'root', level: 0, children: [] };
+  if (lines.length === 0) return root;
 
-  // Build a plain tree first (temporary ids)
-  type Tmp = { label: string; level: number; children: Tmp[] }
-  const rootTmp: Tmp = { label: 'ROOT', level: -1, children: [] }
-  const stack: Tmp[] = [rootTmp]
-  for (const it of items) {
-    while (stack.length && stack[stack.length - 1].level >= it.level) stack.pop()
-    const node: Tmp = { label: it.label, level: it.level, children: [] }
-    stack[stack.length - 1].children.push(node)
-    stack.push(node)
+  type Frame = { node: WbsNode; level: number; childSeq: number };
+  const stack: Frame[] = [{ node: root, level: 0, childSeq: 0 }];
+
+  // keep child index per parent to build stable path ids
+  const childIndex: Map<WbsNode, number> = new Map([[root, 0]]);
+
+  for (const raw of lines) {
+    const m = raw.match(/^(\s*)(.*)$/);
+    if (!m) continue;
+    const indent = m[1] || '';
+    const label = (m[2] || '').trim();
+    if (!label) continue;
+
+    // 2 spaces per level; clamp at least level 1
+    const ilvl = Math.floor(indent.length / 2);
+    const level = Math.max(1, ilvl + 1);
+
+    // Pop to correct parent frame
+    while (stack.length && stack[stack.length - 1].level >= level) {
+      stack.pop();
+    }
+    const parent = stack[stack.length - 1].node;
+
+    // child index for path
+    const idx = (childIndex.get(parent) || 0) + 1;
+    childIndex.set(parent, idx);
+
+    const path = parent.id === 'root' ? `${idx}` : `${parent.id}.${idx}`;
+    const node: WbsNode = { id: path, label, level, children: [] };
+    parent.children.push(node);
+
+    // push new frame for nested children
+    stack.push({ node, level, childSeq: 0 });
+    childIndex.set(node, 0);
   }
 
-  // Assign stable path IDs (e.g., 1, 1.2, 1.2.3) based on sibling index order
-  const toWbs = (n: Tmp, parentPath: string): WbsNode[] => {
-    const out: WbsNode[] = []
-    n.children.forEach((c, i) => {
-      const path = parentPath ? `${parentPath}.${i + 1}` : String(i + 1)
-      const node: WbsNode = {
-        id: path,
-        label: c.label,
-        level: c.level,      // 0 for first level under the (implicit) root
-        children: toWbs(c, path)
-      }
-      out.push(node)
-    })
-    return out
-  }
-
-  return {
-    id: 'root', label: 'ROOT', level: -1, children: toWbs(rootTmp, '')
-  }
+  return root;
 }
-

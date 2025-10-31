@@ -1,3 +1,12 @@
+/* Prevent body from auto-scrolling horizontally */
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;    /* <-- critical: no global horizontal scroll */
+}
+
+
 :root {
   font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.5;
