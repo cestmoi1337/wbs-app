@@ -70,7 +70,7 @@ export default function Diagram({
             shape: 'round-rectangle',
             label: 'data(label)',
             'text-wrap': 'wrap',
-            'text-max-width': textMaxWidth,
+            'text-max-width': `${textMaxWidth}px`,
             'font-size': fontSize,
             'text-valign': 'center',
             'text-halign': 'center',
@@ -110,7 +110,7 @@ export default function Diagram({
           }
     })
 
-    // expose API (with PNG export that adds margin)
+    // Expose PNG export with margin
     if (onReady) {
       const api: DiagramApi = {
         downloadPNG: ({ scale = 2, bg = '#ffffff', margin = 80 } = {}) => {
@@ -118,10 +118,10 @@ export default function Diagram({
             cy.resize()
             cy.fit(undefined, 40)
 
-            // Render graph tight to content
+            // Tight PNG first
             const tight = cy.png({ full: true, scale, bg })
 
-            // Draw onto a larger canvas to add margins
+            // Then draw onto a larger canvas to add margins
             const img = new Image()
             img.onload = () => {
               const canvas = document.createElement('canvas')
@@ -131,7 +131,6 @@ export default function Diagram({
               ctx.fillStyle = bg
               ctx.fillRect(0, 0, canvas.width, canvas.height)
               ctx.drawImage(img, margin, margin)
-
               const out = canvas.toDataURL('image/png')
               const a = document.createElement('a')
               a.href = out
@@ -147,12 +146,12 @@ export default function Diagram({
       onReady(api)
     }
 
-    // Drag → persist positions keyed by path-id
-    cy.nodes().forEach(n => n.grabify())
+    // Drag → persist positions (void-returning forEach)
+    cy.nodes().forEach((n) => { n.grabify() })
     const savePos = () => {
       if (!onPositionsChange) return
       const next: Record<string, Pos> = { ...positions }
-      cy.nodes().forEach(n => {
+      cy.nodes().forEach((n) => {
         const p = n.position()
         next[n.id()] = { x: p.x, y: p.y }
       })
@@ -212,7 +211,7 @@ export default function Diagram({
     if (!cy) return
     cy.style()
       .selector('node').style({
-        'text-max-width': textMaxWidth,
+        'text-max-width': `${textMaxWidth}px`,
         'font-size': fontSize,
         width: boxWidth,
         height: boxHeight
