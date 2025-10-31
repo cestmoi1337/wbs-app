@@ -5,9 +5,13 @@ import { toOutline, renameNode, makeFirstLineRoot } from './lib/wbs'
 import Diagram from './components/Diagram'
 
 const SAMPLE = `Project
-  Planning
+  Initiation
     Define scope
     Identify stakeholders
+  Planning
+    Develop schedule
+    Allocate resources
+  Execution  
   Monitoring
     Meeting
     Meeting
@@ -15,10 +19,8 @@ const SAMPLE = `Project
     Build feature A
     Build feature B
     Build feature C
-  Closeout
-    Handover
-    Retrospective
-    Test`
+  Closeout`
+  
 
 const STORAGE_KEY = 'wbs-outline'
 
