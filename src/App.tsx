@@ -311,7 +311,6 @@ function DiagramPage() {
         <label>Font:&nbsp;<input type="range" min={8} max={48} value={fontSize} onChange={e => setFontSize(parseInt(e.target.value, 10))} /> <span>{fontSize}px</span></label>
         <label>Box W:&nbsp;<input type="range" min={140} max={560} value={boxWidth} onChange={e => setBoxWidth(parseInt(e.target.value, 10))} /> <span>{boxWidth}px</span></label>
         <label>Box H:&nbsp;<input type="range" min={48} max={260} value={boxHeight} onChange={e => setBoxHeight(parseInt(e.target.value, 10))} /> <span>{boxHeight}px</span></label>
-        <button onClick={() => setPositions({})}>Reset layout</button>
 
         <button onClick={() => diagramApi?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 600 })}>
           Download PNG
