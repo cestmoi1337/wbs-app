@@ -6,7 +6,6 @@ import { parseOutline, type WbsNode } from './lib/parseOutline'
 import { toOutline, renameNode, makeFirstLineRoot } from './lib/wbs'
 import Diagram from './components/Diagram'
 
-/* ------------------------- Sample + constants ------------------------- */
 const SAMPLE = `Project
   Planning
     Define scope
@@ -24,16 +23,17 @@ const SAMPLE = `Project
     Test`
 
 const STORAGE_KEY = 'wbs-outline'
-
 type Pos = { x: number; y: number }
-type DiagramApi = { downloadPNG: (opts?: { scale?: number; bg?: string; margin?: number }) => void }
+type DiagramApi = {
+  downloadPNG: (opts?: { scale?: number; bg?: string; margin?: number }) => void
+  downloadSVG: (opts?: { bg?: string; margin?: number }) => void
+}
 
 /* ------------------------- Input Page ------------------------- */
 function InputPage() {
   const navigate = useNavigate()
   const [text, setText] = useState<string>(() => localStorage.getItem(STORAGE_KEY) || SAMPLE)
 
-  // Convert HTML lists -> outline
   const htmlListToOutline = (html: string): string | null => {
     if (!html || !/<(ul|ol|li|br)/i.test(html)) return null
     const parser = new DOMParser()
@@ -63,18 +63,13 @@ function InputPage() {
     return lines.join('\n')
   }
 
-  // Paste handler:
-  // 1) HTML lists
-  // 2) CSV/TSV WITH headers (WBS+Name or Task+Level/Indent)
-  // 3) CSV/TSV WITHOUT headers but 2 columns: WBS-like path + Name
+  // Paste: HTML lists, CSV/TSV w/ headers, CSV/TSV 2 cols (WBS path + Name)
   const onPaste: React.ClipboardEventHandler<HTMLTextAreaElement> = (e) => {
     const html = e.clipboardData.getData('text/html')
     const plain = e.clipboardData.getData('text/plain')
 
-    // 1) Try HTML list → outline
     const convertedList = htmlListToOutline(html)
 
-    // 2/3) Try tabular paste → outline
     const convertedTable = (() => {
       if (!plain) return null
       const looksTabular = plain.includes(',') || plain.includes('\t')
@@ -84,7 +79,7 @@ function InputPage() {
       const firstLine = plain.split(/\r?\n/, 1)[0] || ''
       const lower = firstLine.toLowerCase()
 
-      // 2) Has headers we know?
+      // With headers we know
       const hasInterestingHeaders = /(wbs|name|task|level|indent)/.test(lower)
       if (hasInterestingHeaders) {
         const res = Papa.parse<Record<string, unknown>>(plain, {
@@ -101,17 +96,11 @@ function InputPage() {
         }
       }
 
-      // 3) No headers: heuristic for two columns (WBS path + Name)
-      // Parse without header; accept comma or tab
-      const resNoHeader = Papa.parse<string[]>(plain, {
-        header: false,
-        skipEmptyLines: true,
-        delimiter
-      })
+      // No headers: 2 columns, first looks like WBS path
+      const resNoHeader = Papa.parse<string[]>(plain, { header: false, skipEmptyLines: true, delimiter })
       const data = (resNoHeader.data || []).filter((r) => Array.isArray(r) && r.join('').trim().length > 0)
 
-      // All (or almost all) rows must have at least 2 columns and first col looks like WBS path
-      const wbsRe = /^\d+(?:\.\d+)*$/ // 1, 1.2, 1.4.10, etc.
+      const wbsRe = /^\d+(?:\.\d+)*$/ // 1, 1.2, 1.4.10
       const rows2 = data
         .map((arr) => {
           const c0 = String(arr[0] ?? '').trim()
@@ -124,7 +113,6 @@ function InputPage() {
         const score = rows2.reduce((acc, r) => acc + (wbsRe.test(r.WBS) && r.Name ? 1 : 0), 0)
         const ratio = score / rows2.length
         if (ratio >= 0.7) {
-          // Good enough → treat as WBS+Name rows
           const outline = rowsToOutline(rows2 as unknown as Array<Record<string, unknown>>)
           return outline.trim().length ? outline : null
         }
@@ -135,8 +123,7 @@ function InputPage() {
 
     const converted = convertedList ?? convertedTable
     if (!converted) {
-      // Fall back to the browser’s normal paste
-      return
+      return // let the browser paste normally
     }
 
     e.preventDefault()
@@ -158,7 +145,7 @@ function InputPage() {
     })
   }
 
-  // Tab/Shift+Tab indent/outdent
+  // Tab/Shift+Tab
   const onKeyDown: React.KeyboardEventHandler<HTMLTextAreaElement> = (e) => {
     if (e.key !== 'Tab') return
     e.preventDefault()
@@ -172,10 +159,7 @@ function InputPage() {
 
     const apply = (nv: string, s: number, ed: number) => {
       setText(nv)
-      requestAnimationFrame(() => {
-        t.selectionStart = s
-        t.selectionEnd = ed
-      })
+      requestAnimationFrame(() => { t.selectionStart = s; t.selectionEnd = ed })
     }
 
     if (!e.shiftKey) {
@@ -183,32 +167,20 @@ function InputPage() {
         const lines = val.slice(start, end).split('\n').map((l) => INDENT + l)
         apply(val.slice(0, start) + lines.join('\n') + val.slice(end), start, end + INDENT.length * lines.length)
       } else {
-        const nv = val.slice(0, start) + INDENT + val.slice(start)
-        apply(nv, start + INDENT.length, start + INDENT.length)
+        apply(val.slice(0, start) + INDENT + val.slice(start), start + INDENT.length, start + INDENT.length)
       }
     } else {
       if (isMulti) {
-        const chunk = val.slice(start, end)
-        let removed = 0
-        const out = chunk
-          .split('\n')
-          .map((l) => {
-            if (l.startsWith(INDENT)) {
-              removed += INDENT.length
-              return l.slice(INDENT.length)
-            }
-            return l
-          })
-          .join('\n')
+        const chunk = val.slice(start, end); let removed = 0
+        const out = chunk.split('\n').map(l => {
+          if (l.startsWith(INDENT)) { removed += INDENT.length; return l.slice(INDENT.length) }
+          return l
+        }).join('\n')
         apply(val.slice(0, start) + out + val.slice(end), start, end - removed)
       } else {
         const lineStart = val.lastIndexOf('\n', start - 1) + 1
-        let nv = val,
-          rem = 0
-        if (val.slice(lineStart).startsWith(INDENT)) {
-          nv = val.slice(0, lineStart) + val.slice(lineStart + INDENT.length)
-          rem = INDENT.length
-        }
+        let nv = val, rem = 0
+        if (val.slice(lineStart).startsWith(INDENT)) { nv = val.slice(0, lineStart) + val.slice(lineStart + INDENT.length); rem = INDENT.length }
         const caret = Math.max(start - rem, lineStart)
         apply(nv, caret, caret)
       }
@@ -258,13 +230,10 @@ function ImportPage() {
       setStatus('Parsing…')
       const name = f.name.toLowerCase()
       let outline = ''
-      if (name.endsWith('.csv')) {
-        outline = await parseCsvToOutline(f)
-      } else if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
-        outline = await parseXlsxToOutline(f)
-      } else {
-        throw new Error('Unsupported file type (use .csv or .xlsx)')
-      }
+      if (name.endsWith('.csv')) outline = await parseCsvToOutline(f)
+      else if (name.endsWith('.xlsx') || name.endsWith('.xls')) outline = await parseXlsxToOutline(f)
+      else throw new Error('Unsupported file type (use .csv or .xlsx)')
+
       outline = (outline || '').trim()
       if (!outline) throw new Error('No tasks parsed. Ensure headers include WBS+Name or Task+{Level|Indent}.')
 
@@ -314,9 +283,7 @@ function DiagramPage() {
   const [positions, setPositions] = useState<Record<string, Pos>>({})
   const [diagramApi, setDiagramApi] = useState<DiagramApi | null>(null)
 
-  useEffect(() => {
-    if (!initial.trim()) navigate('/')
-  }, [initial, navigate])
+  useEffect(() => { if (!initial.trim()) navigate('/') }, [initial, navigate])
 
   const handleRename = (id: string, newLabel: string) => {
     const updated = renameNode(root, id, newLabel)
@@ -341,11 +308,18 @@ function DiagramPage() {
         }}
       >
         <button onClick={() => navigate('/')}>← Back to Input</button>
-        <label>Font:&nbsp;<input type="range" min={8} max={48} value={fontSize} onChange={(e) => setFontSize(parseInt(e.target.value, 10))} /> <span>{fontSize}px</span></label>
-        <label>Box W:&nbsp;<input type="range" min={140} max={560} value={boxWidth} onChange={(e) => setBoxWidth(parseInt(e.target.value, 10))} /> <span>{boxWidth}px</span></label>
-        <label>Box H:&nbsp;<input type="range" min={48} max={260} value={boxHeight} onChange={(e) => setBoxHeight(parseInt(e.target.value, 10))} /> <span>{boxHeight}px</span></label>
+        <label>Font:&nbsp;<input type="range" min={8} max={48} value={fontSize} onChange={e => setFontSize(parseInt(e.target.value, 10))} /> <span>{fontSize}px</span></label>
+        <label>Box W:&nbsp;<input type="range" min={140} max={560} value={boxWidth} onChange={e => setBoxWidth(parseInt(e.target.value, 10))} /> <span>{boxWidth}px</span></label>
+        <label>Box H:&nbsp;<input type="range" min={48} max={260} value={boxHeight} onChange={e => setBoxHeight(parseInt(e.target.value, 10))} /> <span>{boxHeight}px</span></label>
         <button onClick={() => setPositions({})}>Reset layout</button>
-        <button onClick={() => diagramApi?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 600 })}>Download PNG</button>
+
+        <button onClick={() => diagramApi?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 600 })}>
+          Download PNG
+        </button>
+        {/* Transparent SVG by default (no bg) */}
+        <button onClick={() => diagramApi?.downloadSVG({ /* bg: undefined */ margin: 120 })}>
+          Download SVG
+        </button>
       </div>
 
       <div style={{ height: '75vh', border: '1px solid #eee', overflow: 'hidden', position: 'relative' }}>
