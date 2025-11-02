@@ -3,7 +3,7 @@ import { HashRouter, Routes, Route, useNavigate } from 'react-router-dom'
 import Papa from 'papaparse'
 import { rowsToOutline, parseCsvToOutline, parseXlsxToOutline } from './lib/importers'
 import { parseOutline, type WbsNode } from './lib/parseOutline'
-import { toOutline, renameNode, makeFirstLineRoot } from './lib/wbs'
+import { toOutline, renameNode } from './lib/wbs'
 import Diagram from './components/Diagram'
 
 const SAMPLE = `Project
@@ -34,6 +34,7 @@ function InputPage() {
   const navigate = useNavigate()
   const [text, setText] = useState<string>(() => localStorage.getItem(STORAGE_KEY) || SAMPLE)
 
+  // Convert HTML lists -> outline
   const htmlListToOutline = (html: string): string | null => {
     if (!html || !/<(ul|ol|li|br)/i.test(html)) return null
     const parser = new DOMParser()
@@ -188,30 +189,41 @@ function InputPage() {
   }
 
   return (
-    <div style={{ padding: 16, display: 'grid', gridTemplateRows: 'auto 1fr auto', height: '100vh' }}>
-      <h1>WBS Builder — Input</h1>
-      <textarea
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onPaste={onPaste}
-        onKeyDown={onKeyDown}
-        style={{ width: '100%', height: '100%', resize: 'none', boxSizing: 'border-box', fontFamily: 'monospace' }}
-        placeholder="Paste outline or WBS/Name table here. Use Tab/Shift+Tab to indent/outdent."
-      />
-      <div style={{ display: 'flex', gap: 12, marginTop: 12 }}>
-        <button onClick={() => setText(makeFirstLineRoot(text))}>Make first line the root</button>
-        <button onClick={() => navigate('/import')}>Import Excel/CSV</button>
-        <button
-          style={{ marginLeft: 'auto' }}
-          onClick={() => {
-            const payload = (text || '').trim() || SAMPLE
-            localStorage.setItem(STORAGE_KEY, payload)
-            navigate('/diagram')
-          }}
-        >
-          Generate →
-        </button>
-      </div>
+    <div className="container">
+      <header className="header">
+        <div>
+          <h1 className="title">WBS Builder</h1>
+          <p className="subtitle">Paste an outline or a WBS/Name table, or import CSV/Excel.</p>
+        </div>
+      </header>
+
+      <main className="content">
+        <section className="card">
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onPaste={onPaste}
+            onKeyDown={onKeyDown}
+            className="textarea"
+            placeholder="Paste outline or WBS/Name table here. Use Tab/Shift+Tab to indent/outdent."
+          />
+
+          <div className="toolbar">
+            <button className="btn" onClick={() => navigate('/import')}>Import Excel/CSV</button>
+            <div className="spacer" />
+            <button
+              className="btn btn-primary"
+              onClick={() => {
+                const payload = (text || '').trim() || SAMPLE
+                localStorage.setItem(STORAGE_KEY, payload)
+                navigate('/diagram')
+              }}
+            >
+              Generate →
+            </button>
+          </div>
+        </section>
+      </main>
     </div>
   )
 }
@@ -250,20 +262,28 @@ function ImportPage() {
   }
 
   return (
-    <div style={{ padding: 16, display: 'grid', gridTemplateRows: 'auto auto 1fr', gap: 12, height: '100vh' }}>
-      <h1>Import Excel / CSV</h1>
-      <div style={{ lineHeight: 1.6 }}>
-        <div><strong>Supported headers (case-insensitive):</strong></div>
-        <div>• <code>WBS, Name</code> (e.g., <code>1.2.3, My task</code>)</div>
-        <div>• <code>Task, Level</code></div>
-        <div>• <code>Task, Indent</code> (indent 0 = level 1)</div>
-      </div>
+    <div className="container">
+      <header className="header">
+        <div>
+          <h1 className="title">Import Excel / CSV</h1>
+          <p className="subtitle">Supported: <code>WBS, Name</code> or <code>Task, Level</code> or <code>Task, Indent</code>.</p>
+        </div>
+        <button className="btn" onClick={() => navigate('/')}>← Back</button>
+      </header>
 
-      <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-        <input type="file" accept=".csv,.xlsx,.xls" onChange={onFileChange} />
-        <button onClick={() => navigate('/')}>← Back</button>
-        <span style={{ color: error ? '#b91c1c' : '#374151' }}>{error || status}</span>
-      </div>
+      <main className="content">
+        <section className="card">
+          <div className="row">
+            <input type="file" accept=".csv,.xlsx,.xls" onChange={onFileChange} />
+            <div className={`status ${error ? 'error' : ''}`}>{error || status}</div>
+          </div>
+          <div className="hint">
+            Examples:
+            <pre>WBS,Name{'\n'}1,Project{'\n'}1.1,Planning{'\n'}1.1.1,Define scope</pre>
+            <pre>Task,Level{'\n'}Project,1{'\n'}Planning,1{'\n'}Define scope,2</pre>
+          </div>
+        </section>
+      </main>
     </div>
   )
 }
@@ -293,47 +313,61 @@ function DiagramPage() {
   }
 
   return (
-    <div style={{ padding: 16 }}>
-      <h1>WBS Builder — Diagram</h1>
-      <div
-        style={{
-          display: 'flex',
-          gap: 12,
-          alignItems: 'center',
-          border: '1px solid #eee',
-          padding: 12,
-          borderRadius: 8,
-          marginBottom: 12,
-          flexWrap: 'wrap'
-        }}
-      >
-        <button onClick={() => navigate('/')}>← Back to Input</button>
-        <label>Font:&nbsp;<input type="range" min={8} max={48} value={fontSize} onChange={e => setFontSize(parseInt(e.target.value, 10))} /> <span>{fontSize}px</span></label>
-        <label>Box W:&nbsp;<input type="range" min={140} max={560} value={boxWidth} onChange={e => setBoxWidth(parseInt(e.target.value, 10))} /> <span>{boxWidth}px</span></label>
-        <label>Box H:&nbsp;<input type="range" min={48} max={260} value={boxHeight} onChange={e => setBoxHeight(parseInt(e.target.value, 10))} /> <span>{boxHeight}px</span></label>
+    <div className="container">
+      <header className="header">
+        <div>
+          <h1 className="title">WBS Diagram</h1>
+          <p className="subtitle">Drag to arrange. Double-click a box to rename.</p>
+        </div>
+        <button className="btn" onClick={() => navigate('/')}>← Back to Input</button>
+      </header>
 
-        <button onClick={() => diagramApi?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 600 })}>
-          Download PNG
-        </button>
-        {/* Transparent SVG by default (no bg) */}
-        <button onClick={() => diagramApi?.downloadSVG({ /* bg: undefined */ margin: 120 })}>
-          Download SVG
-        </button>
-      </div>
+      <main className="content">
+        <section className="card">
+          <div className="toolbar wrap">
+            <div className="group">
+              <label className="label">Font</label>
+              <input type="range" min={8} max={48} value={fontSize} onChange={e => setFontSize(parseInt(e.target.value, 10))} />
+              <span className="mono">{fontSize}px</span>
+            </div>
+            <div className="group">
+              <label className="label">Box W</label>
+              <input type="range" min={140} max={560} value={boxWidth} onChange={e => setBoxWidth(parseInt(e.target.value, 10))} />
+              <span className="mono">{boxWidth}px</span>
+            </div>
+            <div className="group">
+              <label className="label">Box H</label>
+              <input type="range" min={48} max={260} value={boxHeight} onChange={e => setBoxHeight(parseInt(e.target.value, 10))} />
+              <span className="mono">{boxHeight}px</span>
+            </div>
 
-      <div style={{ height: '75vh', border: '1px solid #eee', overflow: 'hidden', position: 'relative' }}>
-        <Diagram
-          root={root}
-          positions={positions}
-          onPositionsChange={setPositions}
-          onRename={handleRename}
-          onReady={setDiagramApi}
-          fontSize={fontSize}
-          boxWidth={boxWidth}
-          boxHeight={boxHeight}
-          textMaxWidth={boxWidth - 20}
-        />
-      </div>
+            <div className="spacer" />
+
+            <button className="btn" onClick={() => diagramApi?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 600 })}>
+              Download PNG
+            </button>
+            <button className="btn btn-primary" onClick={() => diagramApi?.downloadSVG({ /* transparent */ margin: 120 })}>
+              Download SVG
+            </button>
+          </div>
+
+          <div className="diagram-shell">
+            <div style={{ height: '75vh', borderRadius: 8, overflow: 'hidden', position: 'relative' }}>
+              <Diagram
+                root={root}
+                positions={positions}
+                onPositionsChange={setPositions}
+                onRename={handleRename}
+                onReady={setDiagramApi}
+                fontSize={fontSize}
+                boxWidth={boxWidth}
+                boxHeight={boxHeight}
+                textMaxWidth={boxWidth - 20}
+              />
+            </div>
+          </div>
+        </section>
+      </main>
     </div>
   )
 }
