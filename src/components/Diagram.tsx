@@ -1,5 +1,5 @@
 import cytoscape from 'cytoscape'
-import type { Core } from 'cytoscape'
+import type { Core, CollectionReturnValue } from 'cytoscape'
 import dagre from 'cytoscape-dagre'
 import elk from 'cytoscape-elk'
 import svg from 'cytoscape-svg'
@@ -22,11 +22,13 @@ function getVisualRoot(node: WbsNode): WbsNode {
   return node
 }
 
+/** Build Cytoscape elements + a parent->children map for drag logic. */
 function toElements(originalRoot: WbsNode) {
   const root = getVisualRoot(originalRoot)
 
   const nodes: any[] = []
   const edges: any[] = []
+  const childrenById = new Map<string, string[]>() // parentId -> direct children ids
 
   const pushNode = (n: WbsNode) => {
     const lbl = n.label ?? ''
@@ -47,17 +49,13 @@ function toElements(originalRoot: WbsNode) {
     for (const c of n.children || []) {
       pushNode(c)
       const lvl = c.level ?? 0
-      // control point distance: gentle curve that increases with depth
-      const cpd = 60 + lvl * 30
+      const cpd = 60 + lvl * 30 // curved branches in mindmap
       edges.push({
-        data: {
-          id: `${n.id}-${c.id}`,
-          source: n.id,
-          target: c.id,
-          level: lvl,
-          cpd
-        }
+        data: { id: `${n.id}-${c.id}`, source: n.id, target: c.id, level: lvl, cpd }
       })
+      const arr = childrenById.get(n.id) || []
+      arr.push(c.id)
+      childrenById.set(n.id, arr)
       visit(c)
     }
   }
@@ -66,7 +64,8 @@ function toElements(originalRoot: WbsNode) {
   return {
     elements: [...nodes, ...edges],
     nodeIds: nodes.map(n => n.data.id),
-    layoutRootId: root.id
+    layoutRootId: root.id,
+    childrenById
   }
 }
 
@@ -106,6 +105,13 @@ export default function Diagram({
   const cyRef = useRef<Core | null>(null)
   const roRef = useRef<ResizeObserver | null>(null)
   const lastTapRef = useRef<{ id: string; at: number } | null>(null)
+
+  // Drag-group state
+  const dragState = useRef<{
+    anchorId: string
+    initialAnchor: Pos
+    group: Map<string, Pos> // id -> initial pos
+  } | null>(null)
 
   const hardCenter = (cy: Core, padding = 60) => {
     try {
@@ -165,10 +171,29 @@ export default function Diagram({
     } as any)
   }
 
+  // Get all descendant ids for drag-group building
+  const buildDescendantsGetter = (childrenById: Map<string, string[]>) => {
+    const cache = new Map<string, string[]>()
+    const dfs = (id: string): string[] => {
+      if (cache.has(id)) return cache.get(id)!
+      const dir = childrenById.get(id) || []
+      const acc: string[] = []
+      for (const c of dir) {
+        acc.push(c)
+        acc.push(...dfs(c))
+      }
+      cache.set(id, acc)
+      return acc
+    }
+    return dfs
+  }
+
   useEffect(() => {
     if (!ref.current) return
 
-    const { elements, nodeIds, layoutRootId } = toElements(root)
+    const { elements, nodeIds, layoutRootId, childrenById } = toElements(root)
+    const descendantsOf = buildDescendantsGetter(childrenById)
+
     const hasAllPositions =
       nodeIds.length > 0 &&
       nodeIds.every(id => positions[id] && Number.isFinite(positions[id].x) && Number.isFinite(positions[id].y))
@@ -178,6 +203,8 @@ export default function Diagram({
     const cy = cytoscape({
       container: ref.current,
       elements,
+      boxSelectionEnabled: true,     // ← enable drag-box selection
+      selectionType: 'additive',     // ← keep selections while adding more
       style: [
         // Base nodes
         {
@@ -195,6 +222,16 @@ export default function Diagram({
             'background-opacity': 1,
             width: boxWidth,
             height: boxHeight
+          }
+        },
+
+        // Selected nodes highlight
+        {
+          selector: 'node:selected',
+          style: {
+            'border-width': 3,
+            'border-color': '#2563eb',
+            'background-opacity': 0.95
           }
         },
 
@@ -280,7 +317,65 @@ export default function Diagram({
 
     cy.ready(run)
 
-    // Double-click rename
+    // ───────────────────────────────
+    // Parent-drag → move descendants
+    // Multi-select drag → move group
+    // ───────────────────────────────
+    const startGroupDrag = (evt: any) => {
+      const t = evt.target
+      if (!t || t.group?.() !== 'nodes') return
+      const id = t.id()
+
+      // If there is a multi-selection that includes the anchor, drag the selection.
+      const sel = cy.$('node:selected')
+      let group: CollectionReturnValue | null = null
+      if (sel.nonempty() && sel.filter(`#${id}`).nonempty()) {
+        group = sel
+      } else {
+        // Otherwise, drag the node + all descendants
+        const descIds = descendantsOf(id)
+        group = cy.collection([t, ...descIds.map(did => cy.getElementById(did))])
+      }
+
+      const map = new Map<string, Pos>()
+      group.forEach(n => {
+        const p = n.position()
+        map.set(n.id(), { x: p.x, y: p.y })
+      })
+
+      dragState.current = {
+        anchorId: id,
+        initialAnchor: { ...t.position() },
+        group: map
+      }
+    }
+
+    const onDragMove = (evt: any) => {
+      const st = dragState.current
+      if (!st || evt.target.id() !== st.anchorId) return
+      const now = evt.target.position()
+      const dx = now.x - st.initialAnchor.x
+      const dy = now.y - st.initialAnchor.y
+
+      cy.startBatch()
+      for (const [nid, pos] of st.group.entries()) {
+        if (nid === st.anchorId) continue // anchor already being dragged by Cytoscape
+        cy.getElementById(nid).position({ x: pos.x + dx, y: pos.y + dy })
+      }
+      cy.endBatch()
+    }
+
+    const endGroupDrag = () => {
+      if (!dragState.current) return
+      dragState.current = null
+      savePositions()
+    }
+
+    cy.on('grab', 'node', startGroupDrag)
+    cy.on('drag', 'node', onDragMove)
+    cy.on('dragfree', 'node', endGroupDrag)
+
+    // Double-click rename (unchanged)
     const onTap = (evt: any) => {
       const target = evt.target
       if (!target || target.group?.() !== 'nodes') return
@@ -378,15 +473,16 @@ export default function Diagram({
       onReady(api)
     }
 
-    // Drag → persist positions
+    // Dragging enabled for nodes
     cy.nodes().forEach(n => { n.grabify() })
-    const savePos = () => {
+
+    // Persist positions
+    const savePositions = () => {
       if (!onPositionsChange) return
       const next: Record<string, Pos> = {}
       cy.nodes().forEach(n => { const p = n.position(); next[n.id()] = { x: p.x, y: p.y } })
       onPositionsChange(next)
     }
-    cy.on('dragfree', 'node', savePos)
 
     // Fit/center on container resize
     if ('ResizeObserver' in window && ref.current) {
@@ -399,7 +495,9 @@ export default function Diagram({
 
     cyRef.current = cy
     return () => {
-      cy.off('dragfree', 'node', savePos)
+      cy.off('grab', 'node', startGroupDrag)
+      cy.off('drag', 'node', onDragMove)
+      cy.off('dragfree', 'node', endGroupDrag)
       cy.off('tap', 'node', onTap)
       roRef.current?.disconnect(); roRef.current = null
       cy.destroy(); cyRef.current = null

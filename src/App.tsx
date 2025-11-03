@@ -18,10 +18,7 @@ const SAMPLE = `Project
     Build feature A
     Build feature B
     Build feature C
-  Closeout
-    Handover
-    Retrospective
-    Test`
+`
 
 const STORAGE_KEY = 'wbs-outline'
 type Pos = { x: number; y: number }
