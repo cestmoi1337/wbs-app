@@ -4,7 +4,8 @@ import Papa from 'papaparse'
 import { rowsToOutline, parseCsvToOutline, parseXlsxToOutline } from './lib/importers'
 import { parseOutline, type WbsNode } from './lib/parseOutline'
 import { toOutline, renameNode } from './lib/wbs'
-import Diagram from './components/Diagram'
+import Diagram, { type LayoutMode } from './components/Diagram'
+import pkg from '../package.json'
 
 const SAMPLE = `Project
   Planning
@@ -29,12 +30,31 @@ type DiagramApi = {
   downloadSVG: (opts?: { bg?: string; margin?: number }) => void
 }
 
+/* ------------------------- Footer ------------------------- */
+function Footer() {
+  const version = (pkg as any)?.version ?? '0.0.0'
+  const sha = (import.meta as any).env?.VITE_GIT_SHA || 'dev'
+  const short = String(sha).slice(0, 7)
+  return (
+    <footer className="footer">
+      <div className="footer-inner">
+        <span className="mono">WBS Builder v{version}</span>
+        <span className="dot">•</span>
+        <span className="mono">commit {short}</span>
+        <span className="dot">•</span>
+        <a className="link" href="https://github.com/cestmoi1337/wbs-app" target="_blank" rel="noreferrer">
+          GitHub
+        </a>
+      </div>
+    </footer>
+  )
+}
+
 /* ------------------------- Input Page ------------------------- */
 function InputPage() {
   const navigate = useNavigate()
   const [text, setText] = useState<string>(() => localStorage.getItem(STORAGE_KEY) || SAMPLE)
 
-  // Convert HTML lists -> outline
   const htmlListToOutline = (html: string): string | null => {
     if (!html || !/<(ul|ol|li|br)/i.test(html)) return null
     const parser = new DOMParser()
@@ -64,7 +84,6 @@ function InputPage() {
     return lines.join('\n')
   }
 
-  // Paste: HTML lists, CSV/TSV w/ headers, CSV/TSV 2 cols (WBS path + Name)
   const onPaste: React.ClipboardEventHandler<HTMLTextAreaElement> = (e) => {
     const html = e.clipboardData.getData('text/html')
     const plain = e.clipboardData.getData('text/plain')
@@ -80,7 +99,6 @@ function InputPage() {
       const firstLine = plain.split(/\r?\n/, 1)[0] || ''
       const lower = firstLine.toLowerCase()
 
-      // With headers we know
       const hasInterestingHeaders = /(wbs|name|task|level|indent)/.test(lower)
       if (hasInterestingHeaders) {
         const res = Papa.parse<Record<string, unknown>>(plain, {
@@ -92,16 +110,13 @@ function InputPage() {
           const rows = (res.data || []).filter(Boolean)
           const outline = rowsToOutline(rows)
           return outline.trim().length ? outline : null
-        } catch {
-          // fall through to heuristic
-        }
+        } catch {}
       }
 
-      // No headers: 2 columns, first looks like WBS path
       const resNoHeader = Papa.parse<string[]>(plain, { header: false, skipEmptyLines: true, delimiter })
       const data = (resNoHeader.data || []).filter((r) => Array.isArray(r) && r.join('').trim().length > 0)
 
-      const wbsRe = /^\d+(?:\.\d+)*$/ // 1, 1.2, 1.4.10
+      const wbsRe = /^\d+(?:\.\d+)*$/
       const rows2 = data
         .map((arr) => {
           const c0 = String(arr[0] ?? '').trim()
@@ -123,9 +138,7 @@ function InputPage() {
     })()
 
     const converted = convertedList ?? convertedTable
-    if (!converted) {
-      return // let the browser paste normally
-    }
+    if (!converted) return
 
     e.preventDefault()
     const toInsert = converted
@@ -146,7 +159,6 @@ function InputPage() {
     })
   }
 
-  // Tab/Shift+Tab
   const onKeyDown: React.KeyboardEventHandler<HTMLTextAreaElement> = (e) => {
     if (e.key !== 'Tab') return
     e.preventDefault()
@@ -224,6 +236,8 @@ function InputPage() {
           </div>
         </section>
       </main>
+
+      <Footer />
     </div>
   )
 }
@@ -284,6 +298,8 @@ function ImportPage() {
           </div>
         </section>
       </main>
+
+      <Footer />
     </div>
   )
 }
@@ -302,6 +318,7 @@ function DiagramPage() {
   const [boxHeight, setBoxHeight] = useState(72)
   const [positions, setPositions] = useState<Record<string, Pos>>({})
   const [diagramApi, setDiagramApi] = useState<DiagramApi | null>(null)
+  const [layoutMode, setLayoutMode] = useState<LayoutMode>('horizontal')
 
   useEffect(() => { if (!initial.trim()) navigate('/') }, [initial, navigate])
 
@@ -317,7 +334,7 @@ function DiagramPage() {
       <header className="header">
         <div>
           <h1 className="title">WBS Diagram</h1>
-          <p className="subtitle">Drag to arrange. Double-click a box to rename.</p>
+          <p className="subtitle">Choose a layout. Drag to arrange. Double-click a box to rename.</p>
         </div>
         <button className="btn" onClick={() => navigate('/')}>← Back to Input</button>
       </header>
@@ -325,6 +342,15 @@ function DiagramPage() {
       <main className="content">
         <section className="card">
           <div className="toolbar wrap">
+            <div className="group">
+              <label className="label">Layout</label>
+              <select value={layoutMode} onChange={(e) => setLayoutMode(e.target.value as LayoutMode)}>
+                <option value="horizontal">Org — Horizontal</option>
+                <option value="vertical">Org — Vertical</option>
+                <option value="mindmap">Mindmap — Radial</option>
+              </select>
+            </div>
+
             <div className="group">
               <label className="label">Font</label>
               <input type="range" min={8} max={48} value={fontSize} onChange={e => setFontSize(parseInt(e.target.value, 10))} />
@@ -363,11 +389,14 @@ function DiagramPage() {
                 boxWidth={boxWidth}
                 boxHeight={boxHeight}
                 textMaxWidth={boxWidth - 20}
+                layoutMode={layoutMode}
               />
             </div>
           </div>
         </section>
       </main>
+
+      <Footer />
     </div>
   )
 }
