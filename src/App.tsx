@@ -1,412 +1,234 @@
-import { useEffect, useMemo, useState } from 'react'
-import { HashRouter, Routes, Route, useNavigate } from 'react-router-dom'
-import Papa from 'papaparse'
-import { rowsToOutline, parseCsvToOutline, parseXlsxToOutline } from './lib/importers'
-import { parseOutline, type WbsNode } from './lib/parseOutline'
-import { toOutline, renameNode } from './lib/wbs'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Diagram, { type LayoutMode } from './components/Diagram'
-import pkg from '../package.json'
+import { parseOutline, type WbsNode } from './lib/parseOutline'
+import { importOutlineFromFile } from './lib/importers' // ← named import
 
 const SAMPLE = `Project
+  Initiation
+    Develop charter
+    Kickoff
   Planning
     Define scope
     Identify stakeholders
   Monitoring
-    Meeting
-    Meeting
+    Status meetings
+      Meeting 1
+    Weekly reports
+      Report 1
   Execution
     Build feature A
     Build feature B
-    Build feature C
-`
+    Build Feature C
+  Closeout
+    Lessons learned 
+    Closing`
 
-const STORAGE_KEY = 'wbs-outline'
 type Pos = { x: number; y: number }
-type DiagramApi = {
-  downloadPNG: (opts?: { scale?: number; bg?: string; margin?: number }) => void
-  downloadSVG: (opts?: { bg?: string; margin?: number }) => void
-}
 
-/* ------------------------- Footer ------------------------- */
-function Footer() {
-  const version = (pkg as any)?.version ?? '0.0.0'
-  const sha = (import.meta as any).env?.VITE_GIT_SHA || 'dev'
-  const short = String(sha).slice(0, 7)
-  return (
-    <footer className="footer">
-      <div className="footer-inner">
-        <span className="mono">WBS Builder v{version}</span>
-        <span className="dot">•</span>
-        <span className="mono">commit {short}</span>
-        <span className="dot">•</span>
-        <a className="link" href="https://github.com/cestmoi1337/wbs-app" target="_blank" rel="noreferrer">
-          GitHub
-        </a>
-      </div>
-    </footer>
-  )
-}
+export default function App() {
+  const [text, setText] = useState<string>(SAMPLE)
 
-/* ------------------------- Input Page ------------------------- */
-function InputPage() {
-  const navigate = useNavigate()
-  const [text, setText] = useState<string>(() => localStorage.getItem(STORAGE_KEY) || SAMPLE)
+  const [layoutMode, setLayoutMode] = useState<LayoutMode>('horizontal')
+  const [fontSize, setFontSize] = useState<number>(14)
+  const [boxWidth, setBoxWidth] = useState<number>(240)
+  const [boxHeight, setBoxHeight] = useState<number>(80)
+  const [textMaxWidth, setTextMaxWidth] = useState<number>(220)
 
-  const htmlListToOutline = (html: string): string | null => {
-    if (!html || !/<(ul|ol|li|br)/i.test(html)) return null
-    const parser = new DOMParser()
-    const doc = parser.parseFromString(html, 'text/html')
-    const list = doc.body.querySelector('ul,ol')
-    if (!list) return null
+  // Grid defaults ON, 10px
+  const [showGrid, setShowGrid] = useState<boolean>(true)
+  const [gridSize, setGridSize] = useState<number>(10)
+  const [snapToGrid, setSnapToGrid] = useState<boolean>(true)
 
+  // Persisted positions
+  const [positions, setPositions] = useState<Record<string, Pos>>(() => {
+    try { return JSON.parse(localStorage.getItem('wbs-positions') || '{}') } catch { return {} }
+  })
+  useEffect(() => { localStorage.setItem('wbs-positions', JSON.stringify(positions)) }, [positions])
+
+  // Force-remount when we want a fresh layout
+  const [diagramKey, setDiagramKey] = useState<number>(0)
+  const remountDiagram = () => setDiagramKey(k => k + 1)
+
+  const tree: WbsNode = useMemo(() => parseOutline(text), [text])
+
+  const [diagramApi, setDiagramApi] = useState<{
+    downloadPNG: (o?: { scale?: number; bg?: string; margin?: number }) => void
+    downloadSVG: (o?: { bg?: string; margin?: number }) => void
+    fitToScreen: () => void
+  } | null>(null)
+
+  // Rename handler
+  const handleRename = (id: string, newLabel: string) => {
     const lines: string[] = []
-    const walk = (el: Element, depth: number) => {
-      const items = Array.from(el.children).filter((x) => x.tagName.toLowerCase() === 'li') as HTMLElement[]
-      for (const li of items) {
-        const copy = li.cloneNode(true) as HTMLElement
-        copy.querySelectorAll('ul,ol').forEach((n) => n.remove())
-        copy.querySelectorAll('br').forEach((br) => (br.outerHTML = '\n'))
-        const parts = (copy.textContent || '')
-          .replace(/\u00A0/g, ' ')
-          .split(/\n+/)
-          .map((s) => s.trim())
-          .filter(Boolean)
-        for (const p of parts) lines.push(`${'  '.repeat(depth)}${p}`)
-        Array.from(li.children)
-          .filter((x) => /^(ul|ol)$/i.test(x.tagName))
-          .forEach((child) => walk(child, depth + 1))
-      }
+    const walk = (n: WbsNode, depth = 0) => {
+      const label = n.id === id ? newLabel : (n.label ?? '')
+      lines.push(`${'  '.repeat(depth)}${label}`)
+      for (const c of n.children || []) walk(c, depth + 1)
     }
-    walk(list, 0)
-    return lines.join('\n')
+    walk(tree, 0)
+    setText(lines.join('\n'))
   }
 
-  const onPaste: React.ClipboardEventHandler<HTMLTextAreaElement> = (e) => {
-    const html = e.clipboardData.getData('text/html')
-    const plain = e.clipboardData.getData('text/plain')
-
-    const convertedList = htmlListToOutline(html)
-
-    const convertedTable = (() => {
-      if (!plain) return null
-      const looksTabular = plain.includes(',') || plain.includes('\t')
-      if (!looksTabular) return null
-
-      const delimiter = plain.includes('\t') ? '\t' : undefined
-      const firstLine = plain.split(/\r?\n/, 1)[0] || ''
-      const lower = firstLine.toLowerCase()
-
-      const hasInterestingHeaders = /(wbs|name|task|level|indent)/.test(lower)
-      if (hasInterestingHeaders) {
-        const res = Papa.parse<Record<string, unknown>>(plain, {
-          header: true,
-          skipEmptyLines: true,
-          delimiter
-        })
-        try {
-          const rows = (res.data || []).filter(Boolean)
-          const outline = rowsToOutline(rows)
-          return outline.trim().length ? outline : null
-        } catch {}
-      }
-
-      const resNoHeader = Papa.parse<string[]>(plain, { header: false, skipEmptyLines: true, delimiter })
-      const data = (resNoHeader.data || []).filter((r) => Array.isArray(r) && r.join('').trim().length > 0)
-
-      const wbsRe = /^\d+(?:\.\d+)*$/
-      const rows2 = data
-        .map((arr) => {
-          const c0 = String(arr[0] ?? '').trim()
-          const c1 = String(arr[1] ?? '').trim()
-          return { WBS: c0, Name: c1 }
-        })
-        .filter((r) => r.WBS || r.Name)
-
-      if (rows2.length > 0) {
-        const score = rows2.reduce((acc, r) => acc + (wbsRe.test(r.WBS) && r.Name ? 1 : 0), 0)
-        const ratio = score / rows2.length
-        if (ratio >= 0.7) {
-          const outline = rowsToOutline(rows2 as unknown as Array<Record<string, unknown>>)
-          return outline.trim().length ? outline : null
-        }
-      }
-
-      return null
-    })()
-
-    const converted = convertedList ?? convertedTable
-    if (!converted) return
-
-    e.preventDefault()
-    const toInsert = converted
-      .replace(/\u00A0/g, ' ')
-      .replace(/\r\n/g, '\n')
-      .replace(/\t/g, '  ')
-      .trimEnd()
-
-    const target = e.currentTarget
-    const start = target.selectionStart
-    const end = target.selectionEnd
-    const newText = text.slice(0, start) + toInsert + text.slice(end)
-    setText(newText)
-    requestAnimationFrame(() => {
-      const caret = start + toInsert.length
-      target.selectionStart = caret
-      target.selectionEnd = caret
-    })
+  // Reset positions (clear drags)
+  const resetPositions = () => {
+    setPositions({})
+    localStorage.removeItem('wbs-positions')
+    remountDiagram()
+    setTimeout(() => diagramApi?.fitToScreen(), 80)
   }
 
-  const onKeyDown: React.KeyboardEventHandler<HTMLTextAreaElement> = (e) => {
-    if (e.key !== 'Tab') return
-    e.preventDefault()
-    const INDENT = '  '
-    const t = e.currentTarget
-    const start = t.selectionStart
-    const end = t.selectionEnd
-    const val = t.value
-    const selected = val.slice(start, end)
-    const isMulti = selected.includes('\n')
-
-    const apply = (nv: string, s: number, ed: number) => {
-      setText(nv)
-      requestAnimationFrame(() => { t.selectionStart = s; t.selectionEnd = ed })
-    }
-
-    if (!e.shiftKey) {
-      if (isMulti) {
-        const lines = val.slice(start, end).split('\n').map((l) => INDENT + l)
-        apply(val.slice(0, start) + lines.join('\n') + val.slice(end), start, end + INDENT.length * lines.length)
-      } else {
-        apply(val.slice(0, start) + INDENT + val.slice(start), start + INDENT.length, start + INDENT.length)
-      }
-    } else {
-      if (isMulti) {
-        const chunk = val.slice(start, end); let removed = 0
-        const out = chunk.split('\n').map(l => {
-          if (l.startsWith(INDENT)) { removed += INDENT.length; return l.slice(INDENT.length) }
-          return l
-        }).join('\n')
-        apply(val.slice(0, start) + out + val.slice(end), start, end - removed)
-      } else {
-        const lineStart = val.lastIndexOf('\n', start - 1) + 1
-        let nv = val, rem = 0
-        if (val.slice(lineStart).startsWith(INDENT)) { nv = val.slice(0, lineStart) + val.slice(lineStart + INDENT.length); rem = INDENT.length }
-        const caret = Math.max(start - rem, lineStart)
-        apply(nv, caret, caret)
-      }
-    }
-  }
-
-  return (
-    <div className="container">
-      <header className="header">
-        <div>
-          <h1 className="title">WBS Builder</h1>
-          <p className="subtitle">Paste an outline or a WBS/Name table, or import CSV/Excel.</p>
-        </div>
-      </header>
-
-      <main className="content">
-        <section className="card">
-          <textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onPaste={onPaste}
-            onKeyDown={onKeyDown}
-            className="textarea"
-            placeholder="Paste outline or WBS/Name table here. Use Tab/Shift+Tab to indent/outdent."
-          />
-
-          <div className="toolbar">
-            <button className="btn" onClick={() => navigate('/import')}>Import Excel/CSV</button>
-            <div className="spacer" />
-            <button
-              className="btn btn-primary"
-              onClick={() => {
-                const payload = (text || '').trim() || SAMPLE
-                localStorage.setItem(STORAGE_KEY, payload)
-                navigate('/diagram')
-              }}
-            >
-              Generate →
-            </button>
-          </div>
-        </section>
-      </main>
-
-      <Footer />
-    </div>
-  )
-}
-
-/* ------------------------- Import Page ------------------------- */
-function ImportPage() {
-  const navigate = useNavigate()
-  const [status, setStatus] = useState<string>('Choose a .xlsx or .csv file')
-  const [error, setError] = useState<string>('')
-
-  async function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
-    setError('')
+  // Import Excel/CSV
+  const fileRef = useRef<HTMLInputElement>(null)
+  const onChooseFile = () => fileRef.current?.click()
+  const onFilePicked: React.ChangeEventHandler<HTMLInputElement> = async (e) => {
     const f = e.target.files?.[0]
     if (!f) return
     try {
-      setStatus('Parsing…')
-      const name = f.name.toLowerCase()
-      let outline = ''
-      if (name.endsWith('.csv')) outline = await parseCsvToOutline(f)
-      else if (name.endsWith('.xlsx') || name.endsWith('.xls')) outline = await parseXlsxToOutline(f)
-      else throw new Error('Unsupported file type (use .csv or .xlsx)')
-
-      outline = (outline || '').trim()
-      if (!outline) throw new Error('No tasks parsed. Ensure headers include WBS+Name or Task+{Level|Indent}.')
-
-      localStorage.setItem(STORAGE_KEY, outline)
-      setStatus('Imported OK — redirecting…')
-      navigate('/diagram')
-    } catch (err: any) {
+      const outline = await importOutlineFromFile(f)
+      if (outline && outline.trim()) {
+        setText(outline)
+        setPositions({})
+        localStorage.removeItem('wbs-positions')
+        remountDiagram()
+        setTimeout(() => diagramApi?.fitToScreen(), 80)
+      } else {
+        alert('Could not parse that file into an outline.')
+      }
+    } catch (err) {
       console.error(err)
-      setError(err?.message || String(err))
-      setStatus('Choose a .xlsx or .csv file')
+      alert('Import failed. Please ensure the file has the expected columns or outline.')
     } finally {
-      e.currentTarget.value = ''
+      if (fileRef.current) fileRef.current.value = ''
     }
   }
 
   return (
-    <div className="container">
-      <header className="header">
-        <div>
-          <h1 className="title">Import Excel / CSV</h1>
-          <p className="subtitle">Supported: <code>WBS, Name</code> or <code>Task, Level</code> or <code>Task, Indent</code>.</p>
+    <div style={{ height: '100vh', width: '100vw', display: 'flex', overflow: 'hidden', fontFamily: 'Inter, system-ui, Arial, sans-serif' }}>
+      {/* Left: input */}
+      <div style={{ width: 380, borderRight: '1px solid #e5e7eb', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ padding: '12px 12px 8px', borderBottom: '1px solid #f1f5f9' }}>
+          <h2 style={{ margin: 0, fontSize: 16 }}>Project Outline</h2>
+          <p style={{ margin: '6px 0 0', fontSize: 12, color: '#6b7280' }}>
+            Paste an indented outline (spaces denote levels) or import a CSV/Excel file.
+          </p>
         </div>
-        <button className="btn" onClick={() => navigate('/')}>← Back</button>
-      </header>
-
-      <main className="content">
-        <section className="card">
-          <div className="row">
-            <input type="file" accept=".csv,.xlsx,.xls" onChange={onFileChange} />
-            <div className={`status ${error ? 'error' : ''}`}>{error || status}</div>
-          </div>
-          <div className="hint">
-            Examples:
-            <pre>WBS,Name{'\n'}1,Project{'\n'}1.1,Planning{'\n'}1.1.1,Define scope</pre>
-            <pre>Task,Level{'\n'}Project,1{'\n'}Planning,1{'\n'}Define scope,2</pre>
-          </div>
-        </section>
-      </main>
-
-      <Footer />
-    </div>
-  )
-}
-
-/* ------------------------- Diagram Page ------------------------- */
-function DiagramPage() {
-  const navigate = useNavigate()
-  const initial = useMemo(() => {
-    const fromLS = (localStorage.getItem(STORAGE_KEY) || '').trim()
-    return fromLS || SAMPLE
-  }, [])
-
-  const [root, setRoot] = useState<WbsNode>(() => parseOutline(initial))
-  const [fontSize, setFontSize] = useState(12)
-  const [boxWidth, setBoxWidth] = useState(240)
-  const [boxHeight, setBoxHeight] = useState(72)
-  const [positions, setPositions] = useState<Record<string, Pos>>({})
-  const [diagramApi, setDiagramApi] = useState<DiagramApi | null>(null)
-  const [layoutMode, setLayoutMode] = useState<LayoutMode>('horizontal')
-
-  useEffect(() => { if (!initial.trim()) navigate('/') }, [initial, navigate])
-
-  const handleRename = (id: string, newLabel: string) => {
-    const updated = renameNode(root, id, newLabel)
-    setRoot(updated)
-    const newText = toOutline(updated)
-    localStorage.setItem(STORAGE_KEY, newText)
-  }
-
-  return (
-    <div className="container">
-      <header className="header">
-        <div>
-          <h1 className="title">WBS Diagram</h1>
-          <p className="subtitle">Choose a layout. Drag to arrange. Double-click a box to rename.</p>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          spellCheck={false}
+          style={{
+            flex: 1,
+            resize: 'none',
+            border: 'none',
+            outline: 'none',
+            padding: 12,
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+            fontSize: 13,
+            lineHeight: 1.4
+          }}
+        />
+        <div style={{ padding: 12, borderTop: '1px solid #f1f5f9', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button onClick={onChooseFile}>Import Excel/CSV</button>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".csv,.xlsx,.xls"
+            onChange={onFilePicked}
+            style={{ display: 'none' }}
+          />
+          <button onClick={resetPositions}>Reset positions</button>
         </div>
-        <button className="btn" onClick={() => navigate('/')}>← Back to Input</button>
-      </header>
+      </div>
 
-      <main className="content">
-        <section className="card">
-          <div className="toolbar wrap">
-            <div className="group">
-              <label className="label">Layout</label>
-              <select value={layoutMode} onChange={(e) => setLayoutMode(e.target.value as LayoutMode)}>
-                <option value="horizontal">Org — Horizontal</option>
-                <option value="vertical">Org — Vertical</option>
-                <option value="mindmap">Mindmap — Radial</option>
-              </select>
-            </div>
+      {/* Right: diagram + toolbar */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+        {/* Toolbar */}
+        <div
+          style={{
+            padding: 10,
+            display: 'flex',
+            gap: 12,
+            alignItems: 'center',
+            borderBottom: '1px solid #e5e7eb',
+            flexWrap: 'wrap'
+          }}
+        >
+          <label style={{ fontSize: 12 }}>
+            Layout:&nbsp;
+            <select value={layoutMode} onChange={e => setLayoutMode(e.target.value as LayoutMode)}>
+              <option value="horizontal">Horizontal (LR)</option>
+              <option value="vertical">Vertical (Top→Down)</option>
+              <option value="mindmap">Mindmap — Radial</option>
+            </select>
+          </label>
 
-            <div className="group">
-              <label className="label">Font</label>
-              <input type="range" min={8} max={48} value={fontSize} onChange={e => setFontSize(parseInt(e.target.value, 10))} />
-              <span className="mono">{fontSize}px</span>
-            </div>
-            <div className="group">
-              <label className="label">Box W</label>
-              <input type="range" min={140} max={560} value={boxWidth} onChange={e => setBoxWidth(parseInt(e.target.value, 10))} />
-              <span className="mono">{boxWidth}px</span>
-            </div>
-            <div className="group">
-              <label className="label">Box H</label>
-              <input type="range" min={48} max={260} value={boxHeight} onChange={e => setBoxHeight(parseInt(e.target.value, 10))} />
-              <span className="mono">{boxHeight}px</span>
-            </div>
+          <label style={{ fontSize: 12 }}>
+            Font:&nbsp;
+            <input type="range" min={10} max={48} value={fontSize} onChange={e => setFontSize(parseInt(e.target.value, 10))} />
+            &nbsp;{fontSize}px
+          </label>
 
-            <div className="spacer" />
+          <label style={{ fontSize: 12 }}>
+            Box W:&nbsp;
+            <input type="range" min={120} max={420} value={boxWidth} onChange={e => setBoxWidth(parseInt(e.target.value, 10))} />
+            &nbsp;{boxWidth}px
+          </label>
 
-            <button className="btn" onClick={() => diagramApi?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 600 })}>
-              Download PNG
-            </button>
-            <button className="btn btn-primary" onClick={() => diagramApi?.downloadSVG({ /* transparent */ margin: 120 })}>
-              Download SVG
-            </button>
-          </div>
+          <label style={{ fontSize: 12 }}>
+            Box H:&nbsp;
+            <input type="range" min={48} max={220} value={boxHeight} onChange={e => setBoxHeight(parseInt(e.target.value, 10))} />
+            &nbsp;{boxHeight}px
+          </label>
 
-          <div className="diagram-shell">
-            <div style={{ height: '75vh', borderRadius: 8, overflow: 'hidden', position: 'relative' }}>
-              <Diagram
-                root={root}
-                positions={positions}
-                onPositionsChange={setPositions}
-                onRename={handleRename}
-                onReady={setDiagramApi}
-                fontSize={fontSize}
-                boxWidth={boxWidth}
-                boxHeight={boxHeight}
-                textMaxWidth={boxWidth - 20}
-                layoutMode={layoutMode}
-              />
-            </div>
-          </div>
-        </section>
-      </main>
+          <label style={{ fontSize: 12 }}>
+            Text wrap:&nbsp;
+            <input type="range" min={120} max={360} value={textMaxWidth} onChange={e => setTextMaxWidth(parseInt(e.target.value, 10))} />
+            &nbsp;{textMaxWidth}px
+          </label>
 
-      <Footer />
+          <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input type="checkbox" checked={showGrid} onChange={e => setShowGrid(e.target.checked)} />
+            Show grid
+          </label>
+
+          <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input type="checkbox" checked={snapToGrid} onChange={e => setSnapToGrid(e.target.checked)} />
+            Snap to grid
+          </label>
+
+          <label style={{ fontSize: 12 }}>
+            Grid:&nbsp;
+            <input type="range" min={8} max={64} value={gridSize} onChange={e => setGridSize(parseInt(e.target.value, 10))} />
+            &nbsp;{gridSize}px
+          </label>
+
+          <button onClick={() => diagramApi?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 80 })}>
+            Download PNG
+          </button>
+          <button onClick={() => diagramApi?.downloadSVG({ margin: 80 })}>
+            Download SVG
+          </button>
+        </div>
+
+        <div style={{ flex: 1, minHeight: 0 }}>
+          <Diagram
+            key={diagramKey}
+            root={tree}
+            positions={positions}
+            onPositionsChange={setPositions}
+            onRename={handleRename}
+            onReady={setDiagramApi}
+            fontSize={fontSize}
+            boxWidth={boxWidth}
+            boxHeight={boxHeight}
+            textMaxWidth={textMaxWidth}
+            layoutMode={layoutMode}
+            showGrid={showGrid}
+            gridSize={gridSize}
+            snapToGrid={snapToGrid}
+          />
+        </div>
+      </div>
     </div>
-  )
-}
-
-/* ------------------------- App (Router) ------------------------- */
-export default function App() {
-  return (
-    <HashRouter>
-      <Routes>
-        <Route path="/" element={<InputPage />} />
-        <Route path="/import" element={<ImportPage />} />
-        <Route path="/diagram" element={<DiagramPage />} />
-      </Routes>
-    </HashRouter>
   )
 }

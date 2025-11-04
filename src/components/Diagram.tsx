@@ -1,5 +1,5 @@
 import cytoscape from 'cytoscape'
-import type { Core, CollectionReturnValue } from 'cytoscape'
+import type { Core, CollectionReturnValue, NodeSingular } from 'cytoscape'
 import dagre from 'cytoscape-dagre'
 import elk from 'cytoscape-elk'
 import svg from 'cytoscape-svg'
@@ -11,26 +11,45 @@ cytoscape.use(elk as any)
 cytoscape.use(svg as any)
 
 type Pos = { x: number; y: number }
+export type LayoutMode = 'horizontal' | 'vertical' | 'mindmap'
 
-/** If parser wrapped the tree with a synthetic "root" that has exactly one child,
- *  return that child as the visual root. Otherwise return the original node. */
+type DiagramApi = {
+  downloadPNG: (opts?: { scale?: number; bg?: string; margin?: number }) => void
+  downloadSVG: (opts?: { bg?: string; margin?: number }) => void
+  fitToScreen: () => void
+}
+
+type Props = {
+  root: WbsNode
+  positions?: Record<string, Pos>
+  onPositionsChange?: (p: Record<string, Pos>) => void
+  onRename?: (id: string, newLabel: string) => void
+  onReady?: (api: DiagramApi) => void
+  fontSize?: number
+  boxWidth?: number
+  boxHeight?: number
+  textMaxWidth?: number
+  layoutMode?: LayoutMode
+  showGrid?: boolean
+  gridSize?: number
+  snapToGrid?: boolean
+}
+
+/* ───────── helpers ───────── */
+
 function getVisualRoot(node: WbsNode): WbsNode {
   const label = (node.label ?? '').trim().toLowerCase()
-  if (label === 'root' && (node.children?.length ?? 0) === 1) {
-    return node.children![0]
-  }
+  if (label === 'root' && (node.children?.length ?? 0) === 1) return node.children![0]
   return node
 }
 
-/** Build Cytoscape elements + a parent->children map for drag logic. */
 function toElements(originalRoot: WbsNode) {
   const root = getVisualRoot(originalRoot)
-
   const nodes: any[] = []
   const edges: any[] = []
-  const childrenById = new Map<string, string[]>() // parentId -> direct children ids
+  const childrenById = new Map<string, string[]>()
 
-  // push the visual root and tag it
+  // visual root
   {
     const lbl = root.label ?? ''
     nodes.push({
@@ -62,10 +81,8 @@ function toElements(originalRoot: WbsNode) {
     for (const c of n.children || []) {
       pushChild(c)
       const lvl = c.level ?? 0
-      const cpd = 60 + lvl * 30 // curved branches in mindmap
-      edges.push({
-        data: { id: `${n.id}-${c.id}`, source: n.id, target: c.id, level: lvl, cpd }
-      })
+      const cpd = 60 + lvl * 30 // mindmap curve distance
+      edges.push({ data: { id: `${n.id}-${c.id}`, source: n.id, target: c.id, level: lvl, cpd } })
       const arr = childrenById.get(n.id) || []
       arr.push(c.id)
       childrenById.set(n.id, arr)
@@ -74,36 +91,25 @@ function toElements(originalRoot: WbsNode) {
   }
   visit(root)
 
-  return {
-    elements: [...nodes, ...edges],
-    nodeIds: nodes.map(n => n.data.id),
-    layoutRootId: root.id,
-    childrenById
-  }
+  return { elements: [...nodes, ...edges], nodeIds: nodes.map(n => n.data.id), layoutRootId: root.id, childrenById }
 }
 
-type DiagramApi = {
-  downloadPNG: (opts?: { scale?: number; bg?: string; margin?: number }) => void
-  downloadSVG: (opts?: { bg?: string; margin?: number }) => void
+/** Center a parent horizontally over the span of its immediate children */
+function centerParentOverChildren(n: NodeSingular) {
+  const kids = n.outgoers('node')
+  if (!kids || kids.empty()) return
+  const bb = kids.boundingBox()
+  const y = n.position('y')
+  const cx = bb.x1 + bb.w / 2
+  n.position({ x: cx, y })
 }
 
-export type LayoutMode = 'horizontal' | 'vertical' | 'mindmap'
-
-type Props = {
-  root: WbsNode
-  positions?: Record<string, Pos>
-  onPositionsChange?: (p: Record<string, Pos>) => void
-  onRename?: (id: string, newLabel: string) => void
-  onReady?: (api: DiagramApi) => void
-  fontSize?: number
-  boxWidth?: number
-  boxHeight?: number
-  textMaxWidth?: number
-  layoutMode?: LayoutMode
-  // NEW: grid helpers
-  showGrid?: boolean
-  gridSize?: number
-  snapToGrid?: boolean
+/** For vertical layout: center root and level-1 parents over their children */
+function postCenterParentsVertical(cy: Core) {
+  const roots = cy.nodes().roots()
+  roots.forEach(centerParentOverChildren)
+  const l1 = roots.outgoers('node')
+  l1.forEach(centerParentOverChildren)
 }
 
 export default function Diagram({
@@ -117,28 +123,25 @@ export default function Diagram({
   boxHeight = 72,
   textMaxWidth = 220,
   layoutMode = 'horizontal',
-  // Grid defaults
-  showGrid = false,
-  gridSize = 16,
-  snapToGrid = false
+  showGrid = true,
+  gridSize = 10,
+  snapToGrid = true
 }: Props) {
   const ref = useRef<HTMLDivElement>(null)
   const cyRef = useRef<Core | null>(null)
   const roRef = useRef<ResizeObserver | null>(null)
   const lastTapRef = useRef<{ id: string; at: number } | null>(null)
 
-  // Drag-group state
   const dragState = useRef<{
     anchorId: string
     initialAnchor: Pos
-    group: Map<string, Pos> // id -> initial pos
+    group: Map<string, Pos>
   } | null>(null)
 
   const hardCenter = (cy: Core, padding = 60) => {
     try {
       const bb = cy.elements().boundingBox()
-      const w = cy.width()
-      const h = cy.height()
+      const w = cy.width(), h = cy.height()
       if (!w || !h || !isFinite(bb.w) || !isFinite(bb.h) || bb.w === 0 || bb.h === 0) return
       const zoom = Math.max(0.02, Math.min(w / (bb.w + padding * 2), h / (bb.h + padding * 2)))
       const cx = bb.x1 + bb.w / 2
@@ -148,11 +151,11 @@ export default function Diagram({
     } catch {}
   }
 
-  const makeLayout = (cy: Core, canUsePreset: boolean, layoutRootId: string) => {
+  // NOTE: layoutRootId no longer needed (mindmap uses cy.nodes().roots())
+  const makeLayout = (cy: Core, canUsePreset: boolean) => {
     if (layoutMode !== 'mindmap' && canUsePreset) {
       return cy.layout({ name: 'preset', positions: (n: any) => positions[n.id()] })
     }
-
     if (layoutMode === 'vertical') {
       return cy.layout({
         name: 'elk',
@@ -161,62 +164,53 @@ export default function Diagram({
         elk: {
           algorithm: 'layered',
           'elk.direction': 'DOWN',
+          // spacing
           'elk.layered.spacing.nodeNodeBetweenLayers': 120,
           'elk.spacing.nodeNode': 60,
+          // routing
           'elk.edgeRouting': 'ORTHOGONAL',
-          'elk.layered.wrapping.strategy': 'SINGLE_EDGE',
-          'elk.layered.mergeEdges': true
+          'elk.layered.mergeEdges': true,
+          // try to center (ELK)
+          'elk.layered.nodePlacement.strategy': 'BRANDES_KOEPF',
+          'elk.layered.nodePlacement.bk.fixedAlignment': 'CENTER'
         }
       } as any)
     }
-
     if (layoutMode === 'mindmap') {
-      // Stable radial layout (root-centered)
+      // use actual roots that Cytoscape detects from edges
+      const rootsSel =
+        cy.nodes().roots().map(n => `#${n.id()}`).join(',') || undefined
       return cy.layout({
         name: 'breadthfirst',
         directed: true,
-        roots: `#${layoutRootId}`,
+        roots: rootsSel,
         circle: true,
         spacingFactor: 1.6,
         avoidOverlap: true,
         animate: false
       } as any)
     }
-
-    // Horizontal (org-chart like)
-    return cy.layout({
-      name: 'dagre',
-      rankDir: 'LR',
-      nodeSep: 60,
-      rankSep: 120
-    } as any)
+    // horizontal (LR)
+    return cy.layout({ name: 'dagre', rankDir: 'LR', nodeSep: 60, rankSep: 120 } as any)
   }
 
-  // Get all descendant ids for drag-group building
   const buildDescendantsGetter = (childrenById: Map<string, string[]>) => {
     const cache = new Map<string, string[]>()
     const dfs = (id: string): string[] => {
       if (cache.has(id)) return cache.get(id)!
       const dir = childrenById.get(id) || []
       const acc: string[] = []
-      for (const c of dir) {
-        acc.push(c)
-        acc.push(...dfs(c))
-      }
+      for (const c of dir) { acc.push(c); acc.push(...dfs(c)) }
       cache.set(id, acc)
       return acc
     }
     return dfs
   }
 
-  // Grid helpers
-  const roundToGrid = (v: number, g = gridSize) => Math.round(v / g) * g
-
   useEffect(() => {
     if (!ref.current) return
 
-    const { elements, nodeIds, layoutRootId, childrenById } = toElements(root)
-    const descendantsOf = buildDescendantsGetter(childrenById)
+const { elements, nodeIds, childrenById } = toElements(root)
 
     const hasAllPositions =
       nodeIds.length > 0 &&
@@ -227,10 +221,9 @@ export default function Diagram({
     const cy = cytoscape({
       container: ref.current,
       elements,
-      boxSelectionEnabled: true,     // ← enable drag-box selection
-      selectionType: 'additive',     // ← keep selections while adding more
+      boxSelectionEnabled: true,
+      selectionType: 'additive',
       style: [
-        // Base nodes
         {
           selector: 'node',
           style: {
@@ -248,18 +241,7 @@ export default function Diagram({
             height: boxHeight
           }
         },
-
-        // Selected nodes highlight
-        {
-          selector: 'node:selected',
-          style: {
-            'border-width': 3,
-            'border-color': '#2563eb',
-            'background-opacity': 0.95
-          }
-        },
-
-        // Mindmap pills (compact & proportional)
+        { selector: 'node:selected', style: { 'border-width': 3, 'border-color': '#2563eb', 'background-opacity': 0.95 } },
         ...(layoutMode === 'mindmap'
           ? [{
               selector: 'node',
@@ -272,24 +254,14 @@ export default function Diagram({
               }
             } as any]
           : []),
-
-        // Mindmap: we will *also* set visual-root sizes dynamically in the live updater
-
-        // Node colors by level
         { selector: 'node[level = 0]', style: { 'background-color': '#c7d2fe', 'border-color': '#93c5fd' } },
         { selector: 'node[level = 1]', style: { 'background-color': '#dbeafe', 'border-color': '#93c5fd' } },
         { selector: 'node[level = 2]', style: { 'background-color': '#dcfce7', 'border-color': '#86efac' } },
         { selector: 'node[level = 3]', style: { 'background-color': '#fef9c3', 'border-color': '#fde68a' } },
         { selector: 'node[level = 4]', style: { 'background-color': '#fee2e2', 'border-color': '#fca5a5' } },
         { selector: 'node[level >= 5]', style: { 'background-color': '#fef9c3', 'border-color': '#fde68a' } },
-
-        // Base edge styling
         { selector: 'edge', style: { width: 2.5, 'line-opacity': 1, 'line-color': '#94a3b8', 'curve-style': 'bezier' } },
-
-        // Make edges from root’s children a bit thicker (optional polish)
         { selector: 'edge[level = 1]', style: { width: 3.5 } },
-
-        // Mindmap: smooth organic curves using per-edge control points
         ...(layoutMode === 'mindmap'
           ? [{
               selector: 'edge',
@@ -301,8 +273,6 @@ export default function Diagram({
               }
             } as any]
           : []),
-
-        // Vertical: orthogonal connectors
         ...(layoutMode === 'vertical'
           ? [{
               selector: 'edge',
@@ -318,15 +288,11 @@ export default function Diagram({
       layout: { name: 'preset' }
     })
 
-    // Set grid background on container
+    // grid background
     const applyGridBg = () => {
       if (!ref.current) return
-      if (!showGrid) {
-        ref.current.style.background = '#f7f7f7'
-        return
-      }
+      if (!showGrid) { ref.current.style.background = '#f7f7f7'; return }
       const g = gridSize
-      // simple square grid using two perpendicular linear-gradients
       ref.current.style.background = `
         linear-gradient(to right, rgba(0,0,0,0.06) 1px, transparent 1px),
         linear-gradient(to bottom, rgba(0,0,0,0.06) 1px, transparent 1px),
@@ -352,49 +318,53 @@ export default function Diagram({
       } catch {}
     }
 
+    const savePositions = () => {
+      if (!onPositionsChange) return
+      const next: Record<string, Pos> = {}
+      cy.nodes().forEach(n => { const p = n.position(); next[n.id()] = { x: p.x, y: p.y } })
+      onPositionsChange(next)
+    }
+
     const run = () => {
-      const layout = makeLayout(cy, usePreset, layoutRootId)
+      const layout = makeLayout(cy, usePreset)
       if (layoutMode === 'mindmap') { try { cy.reset() } catch {} }
-      cy.one('layoutstop', fitAll)
+
+      const after = () => {
+        if (layoutMode === 'vertical') {
+          try {
+            postCenterParentsVertical(cy)
+            savePositions()
+          } catch {}
+        }
+        fitAll()
+      }
+
+      cy.one('layoutstop', after)
       layout.run()
-      setTimeout(fitAll, 50)
-      setTimeout(fitAll, 200)
-      setTimeout(fitAll, 400)
+      setTimeout(after, 50)
+      setTimeout(after, 200)
+      setTimeout(after, 400)
     }
 
     cy.ready(run)
 
-    // ───────────────────────────────
-    // Parent-drag → move descendants
-    // Multi-select drag → move group
-    // ───────────────────────────────
+    /* ─── drag grouping ─── */
     const startGroupDrag = (evt: any) => {
       const t = evt.target
       if (!t || t.group?.() !== 'nodes') return
       const id = t.id()
-
-      // If there is a multi-selection that includes the anchor, drag the selection.
       const sel = cy.$('node:selected')
-      let group: CollectionReturnValue | null = null
+      let group: CollectionReturnValue
       if (sel.nonempty() && sel.filter(`#${id}`).nonempty()) {
         group = sel
       } else {
-        // Otherwise, drag the node + all descendants
+        const descendantsOf = buildDescendantsGetter(childrenById)
         const descIds = descendantsOf(id)
         group = cy.collection([t, ...descIds.map(did => cy.getElementById(did))])
       }
-
       const map = new Map<string, Pos>()
-      group.forEach(n => {
-        const p = n.position()
-        map.set(n.id(), { x: p.x, y: p.y })
-      })
-
-      dragState.current = {
-        anchorId: id,
-        initialAnchor: { ...t.position() },
-        group: map
-      }
+      group.forEach(n => { const p = n.position(); map.set(n.id(), { x: p.x, y: p.y }) })
+      dragState.current = { anchorId: id, initialAnchor: { ...t.position() }, group: map }
     }
 
     const onDragMove = (evt: any) => {
@@ -403,34 +373,50 @@ export default function Diagram({
       const now = evt.target.position()
       const dx = now.x - st.initialAnchor.x
       const dy = now.y - st.initialAnchor.y
-
       cy.startBatch()
       for (const [nid, pos] of st.group.entries()) {
-        if (nid === st.anchorId) continue // anchor already being dragged by Cytoscape
+        if (nid === st.anchorId) continue
         cy.getElementById(nid).position({ x: pos.x + dx, y: pos.y + dy })
       }
       cy.endBatch()
     }
 
-    const savePositions = () => {
-      if (!onPositionsChange) return
-      const next: Record<string, Pos> = {}
-      cy.nodes().forEach(n => { const p = n.position(); next[n.id()] = { x: p.x, y: p.y } })
-      onPositionsChange(next)
+    // border-aligned snap-to-grid
+    const snapGroupToGrid = () => {
+      if (!dragState.current || !snapToGrid) return
+      const z = cy.zoom()
+      const pan = cy.pan()
+      const step = gridSize
+
+      cy.startBatch()
+      for (const nid of dragState.current.group.keys()) {
+        const ele = cy.getElementById(nid)
+
+        // center in screen px
+        const p = ele.position()
+        const sx = p.x * z + pan.x
+        const sy = p.y * z + pan.y
+
+        // half extents in screen px
+        const halfW = ele.renderedWidth() / 2
+        const halfH = ele.renderedHeight() / 2
+
+        // snap top-left border, then compute center
+        const left = sx - halfW
+        const top = sy - halfH
+        const left2 = Math.round(left / step) * step
+        const top2 = Math.round(top / step) * step
+        const sx2 = left2 + halfW
+        const sy2 = top2 + halfH
+
+        // back to model coords
+        ele.position({ x: (sx2 - pan.x) / z, y: (sy2 - pan.y) / z })
+      }
+      cy.endBatch()
     }
 
     const endGroupDrag = () => {
-      if (!dragState.current) return
-      // Snap to grid on release (if enabled)
-      if (snapToGrid) {
-        cy.startBatch()
-        for (const nid of dragState.current.group.keys()) {
-          const ele = cy.getElementById(nid)
-          const p = ele.position()
-          ele.position({ x: roundToGrid(p.x), y: roundToGrid(p.y) })
-        }
-        cy.endBatch()
-      }
+      snapGroupToGrid()
       dragState.current = null
       savePositions()
     }
@@ -438,8 +424,9 @@ export default function Diagram({
     cy.on('grab', 'node', startGroupDrag)
     cy.on('drag', 'node', onDragMove)
     cy.on('dragfree', 'node', endGroupDrag)
+    cy.on('free', 'node', endGroupDrag)
 
-    // Double-click rename
+    // double-tap rename
     const onTap = (evt: any) => {
       const target = evt.target
       if (!target || target.group?.() !== 'nodes') return
@@ -458,7 +445,7 @@ export default function Diagram({
     }
     cy.on('tap', 'node', onTap)
 
-    // Export API
+    // export API
     if (onReady) {
       const api: DiagramApi = {
         downloadPNG: ({ scale = 2, bg = '#ffffff', margin = 80 } = {}) => {
@@ -476,8 +463,7 @@ export default function Diagram({
               ctx.drawImage(img, margin, margin)
               const out = canvas.toDataURL('image/png')
               const a = document.createElement('a')
-              a.href = out
-              a.download = 'wbs.png'
+              a.href = out; a.download = 'wbs.png'
               document.body.appendChild(a); a.click(); a.remove()
             }
             img.src = tight
@@ -490,29 +476,22 @@ export default function Diagram({
             const parser = new DOMParser()
             const doc = parser.parseFromString(raw, 'image/svg+xml')
             const svgEl = doc.documentElement
-
             const widthAttr = svgEl.getAttribute('width')
             const heightAttr = svgEl.getAttribute('height')
             const viewBoxAttr = svgEl.getAttribute('viewBox')
-
             let w = 0, h = 0, vbX = 0, vbY = 0, vbW = 0, vbH = 0
             if (viewBoxAttr) {
               const parts = viewBoxAttr.split(/\s+/).map(Number)
-              ;[vbX, vbY, vbW, vbH] = parts
-              w = vbW; h = vbH
+              ;[vbX, vbY, vbW, vbH] = parts; w = vbW; h = vbH
             } else if (widthAttr && heightAttr) {
               w = parseFloat(widthAttr); h = parseFloat(heightAttr)
-              svgEl.setAttribute('viewBox', `0 0 ${w} ${h}`)
-              vbW = w; vbH = h
+              svgEl.setAttribute('viewBox', `0 0 ${w} ${h}`); vbW = w; vbH = h
             }
-
-            const newW = w + margin * 2
-            const newH = h + margin * 2
+            const newW = w + margin * 2, newH = h + margin * 2
             const newViewBox = `${vbX - margin} ${vbY - margin} ${newW} ${newH}`
             svgEl.setAttribute('viewBox', newViewBox)
             svgEl.setAttribute('width', String(newW))
             svgEl.setAttribute('height', String(newH))
-
             if (bg) {
               const rect = doc.createElementNS('http://www.w3.org/2000/svg', 'rect')
               rect.setAttribute('x', String(vbX - margin))
@@ -522,31 +501,40 @@ export default function Diagram({
               rect.setAttribute('fill', bg)
               svgEl.insertBefore(rect, svgEl.firstChild)
             }
-
             const xml = new XMLSerializer().serializeToString(svgEl)
             const blob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' })
             const url = URL.createObjectURL(blob)
             const a = document.createElement('a')
-            a.href = url
-            a.download = 'wbs.svg'
+            a.href = url; a.download = 'wbs.svg'
             document.body.appendChild(a); a.click(); a.remove()
             URL.revokeObjectURL(url)
           } catch {}
-        }
+        },
+        fitToScreen: () => { try { cy.resize(); hardCenter(cy, 60) } catch {} }
       }
       onReady(api)
     }
 
-    // Make sure nodes can be dragged
+    // larger visual root (1.25×)
+    const scale = 1.25
+    cy.style()
+      .selector('node.visual-root').style({
+        'text-max-width': `${Math.round(textMaxWidth * scale)}px`,
+        'font-size': fontSize * scale,
+        width: boxWidth * scale,
+        height: boxHeight * scale,
+        padding: `${Math.round(12 * scale)}px`,
+        'border-width': 3
+      })
+      .update()
+
+    // draggable
     cy.nodes().forEach(n => { n.grabify() })
 
-    // Fit/center on container resize
+    // resize observer
     if ('ResizeObserver' in window && ref.current) {
-      const ro = new ResizeObserver(() => {
-        try { cy.resize(); hardCenter(cy, 60) } catch {}
-      })
-      ro.observe(ref.current)
-      roRef.current = ro
+      const ro = new ResizeObserver(() => { try { cy.resize(); hardCenter(cy, 60) } catch {} })
+      ro.observe(ref.current); roRef.current = ro
     }
 
     cyRef.current = cy
@@ -554,35 +542,19 @@ export default function Diagram({
       cy.off('grab', 'node', startGroupDrag)
       cy.off('drag', 'node', onDragMove)
       cy.off('dragfree', 'node', endGroupDrag)
+      cy.off('free', 'node', endGroupDrag)
       cy.off('tap', 'node', onTap)
       roRef.current?.disconnect(); roRef.current = null
       cy.destroy(); cyRef.current = null
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [root, layoutMode, showGrid, gridSize, snapToGrid])
+    // NOTE: do not depend on `positions`; prevents spring-back while dragging
+  }, [root, layoutMode, showGrid, gridSize, snapToGrid, fontSize, boxWidth, boxHeight, textMaxWidth])
 
-  // Re-run layout when the mode changes
+  // live style updates (keep root 1.25×)
   useEffect(() => {
-    const cy = cyRef.current
-    if (!cy) return
-    const vis = getVisualRoot(root)
-    const layout = makeLayout(cy, layoutMode !== 'mindmap' && false, vis.id)
-    if (layoutMode === 'mindmap') { try { cy.reset() } catch {} }
-    cy.one('layoutstop', () => { try { cy.resize(); hardCenter(cy, 60) } catch {} })
-    layout.run()
-    setTimeout(() => { try { cy.resize(); hardCenter(cy, 60) } catch {} }, 50)
-    setTimeout(() => { try { cy.resize(); hardCenter(cy, 60) } catch {} }, 200)
-    setTimeout(() => { try { cy.resize(); hardCenter(cy, 60) } catch {} }, 400)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layoutMode])
-
-  // Live style updates — keep root always 25% bigger than others
-  useEffect(() => {
-    const cy = cyRef.current
-    if (!cy) return
+    const cy = cyRef.current; if (!cy) return
     const scale = 1.25
     const px = (n: number) => Math.round(n)
-
     cy.style()
       .selector('node').style({
         'text-max-width': `${textMaxWidth}px`,
@@ -602,7 +574,7 @@ export default function Diagram({
       .update()
   }, [fontSize, boxWidth, boxHeight, textMaxWidth])
 
-  // Update the grid background if these change without re-creating cy
+  // grid background live updates
   useEffect(() => {
     if (!ref.current) return
     if (!showGrid) {
