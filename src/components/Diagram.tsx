@@ -30,7 +30,22 @@ function toElements(originalRoot: WbsNode) {
   const edges: any[] = []
   const childrenById = new Map<string, string[]>() // parentId -> direct children ids
 
-  const pushNode = (n: WbsNode) => {
+  // push the visual root and tag it
+  {
+    const lbl = root.label ?? ''
+    nodes.push({
+      data: {
+        id: root.id,
+        label: lbl,
+        level: root.level ?? 0,
+        len: lbl.length,
+        lines: Math.max(1, Math.ceil(lbl.length / 18))
+      },
+      classes: 'visual-root'
+    })
+  }
+
+  const pushChild = (n: WbsNode) => {
     const lbl = n.label ?? ''
     nodes.push({
       data: {
@@ -43,11 +58,9 @@ function toElements(originalRoot: WbsNode) {
     })
   }
 
-  pushNode(root)
-
   const visit = (n: WbsNode) => {
     for (const c of n.children || []) {
-      pushNode(c)
+      pushChild(c)
       const lvl = c.level ?? 0
       const cpd = 60 + lvl * 30 // curved branches in mindmap
       edges.push({
@@ -87,6 +100,10 @@ type Props = {
   boxHeight?: number
   textMaxWidth?: number
   layoutMode?: LayoutMode
+  // NEW: grid helpers
+  showGrid?: boolean
+  gridSize?: number
+  snapToGrid?: boolean
 }
 
 export default function Diagram({
@@ -99,7 +116,11 @@ export default function Diagram({
   boxWidth = 240,
   boxHeight = 72,
   textMaxWidth = 220,
-  layoutMode = 'horizontal'
+  layoutMode = 'horizontal',
+  // Grid defaults
+  showGrid = false,
+  gridSize = 16,
+  snapToGrid = false
 }: Props) {
   const ref = useRef<HTMLDivElement>(null)
   const cyRef = useRef<Core | null>(null)
@@ -188,6 +209,9 @@ export default function Diagram({
     return dfs
   }
 
+  // Grid helpers
+  const roundToGrid = (v: number, g = gridSize) => Math.round(v / g) * g
+
   useEffect(() => {
     if (!ref.current) return
 
@@ -249,6 +273,8 @@ export default function Diagram({
             } as any]
           : []),
 
+        // Mindmap: we will *also* set visual-root sizes dynamically in the live updater
+
         // Node colors by level
         { selector: 'node[level = 0]', style: { 'background-color': '#c7d2fe', 'border-color': '#93c5fd' } },
         { selector: 'node[level = 1]', style: { 'background-color': '#dbeafe', 'border-color': '#93c5fd' } },
@@ -259,6 +285,9 @@ export default function Diagram({
 
         // Base edge styling
         { selector: 'edge', style: { width: 2.5, 'line-opacity': 1, 'line-color': '#94a3b8', 'curve-style': 'bezier' } },
+
+        // Make edges from root’s children a bit thicker (optional polish)
+        { selector: 'edge[level = 1]', style: { width: 3.5 } },
 
         // Mindmap: smooth organic curves using per-edge control points
         ...(layoutMode === 'mindmap'
@@ -288,6 +317,24 @@ export default function Diagram({
       ],
       layout: { name: 'preset' }
     })
+
+    // Set grid background on container
+    const applyGridBg = () => {
+      if (!ref.current) return
+      if (!showGrid) {
+        ref.current.style.background = '#f7f7f7'
+        return
+      }
+      const g = gridSize
+      // simple square grid using two perpendicular linear-gradients
+      ref.current.style.background = `
+        linear-gradient(to right, rgba(0,0,0,0.06) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(0,0,0,0.06) 1px, transparent 1px),
+        #f7f7f7
+      `
+      ref.current.style.backgroundSize = `${g}px ${g}px, ${g}px ${g}px, auto`
+    }
+    applyGridBg()
 
     const fitAll = () => {
       try {
@@ -365,8 +412,25 @@ export default function Diagram({
       cy.endBatch()
     }
 
+    const savePositions = () => {
+      if (!onPositionsChange) return
+      const next: Record<string, Pos> = {}
+      cy.nodes().forEach(n => { const p = n.position(); next[n.id()] = { x: p.x, y: p.y } })
+      onPositionsChange(next)
+    }
+
     const endGroupDrag = () => {
       if (!dragState.current) return
+      // Snap to grid on release (if enabled)
+      if (snapToGrid) {
+        cy.startBatch()
+        for (const nid of dragState.current.group.keys()) {
+          const ele = cy.getElementById(nid)
+          const p = ele.position()
+          ele.position({ x: roundToGrid(p.x), y: roundToGrid(p.y) })
+        }
+        cy.endBatch()
+      }
       dragState.current = null
       savePositions()
     }
@@ -375,7 +439,7 @@ export default function Diagram({
     cy.on('drag', 'node', onDragMove)
     cy.on('dragfree', 'node', endGroupDrag)
 
-    // Double-click rename (unchanged)
+    // Double-click rename
     const onTap = (evt: any) => {
       const target = evt.target
       if (!target || target.group?.() !== 'nodes') return
@@ -473,16 +537,8 @@ export default function Diagram({
       onReady(api)
     }
 
-    // Dragging enabled for nodes
+    // Make sure nodes can be dragged
     cy.nodes().forEach(n => { n.grabify() })
-
-    // Persist positions
-    const savePositions = () => {
-      if (!onPositionsChange) return
-      const next: Record<string, Pos> = {}
-      cy.nodes().forEach(n => { const p = n.position(); next[n.id()] = { x: p.x, y: p.y } })
-      onPositionsChange(next)
-    }
 
     // Fit/center on container resize
     if ('ResizeObserver' in window && ref.current) {
@@ -503,7 +559,7 @@ export default function Diagram({
       cy.destroy(); cyRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [root, layoutMode])
+  }, [root, layoutMode, showGrid, gridSize, snapToGrid])
 
   // Re-run layout when the mode changes
   useEffect(() => {
@@ -520,19 +576,47 @@ export default function Diagram({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layoutMode])
 
-  // Live style updates
+  // Live style updates — keep root always 25% bigger than others
   useEffect(() => {
     const cy = cyRef.current
     if (!cy) return
+    const scale = 1.25
+    const px = (n: number) => Math.round(n)
+
     cy.style()
       .selector('node').style({
         'text-max-width': `${textMaxWidth}px`,
         'font-size': fontSize,
         width: boxWidth,
-        height: boxHeight
+        height: boxHeight,
+        padding: '12px'
+      })
+      .selector('node.visual-root').style({
+        'text-max-width': `${px(textMaxWidth * scale)}px`,
+        'font-size': fontSize * scale,
+        width: boxWidth * scale,
+        height: boxHeight * scale,
+        padding: `${px(12 * scale)}px`,
+        'border-width': 3
       })
       .update()
   }, [fontSize, boxWidth, boxHeight, textMaxWidth])
+
+  // Update the grid background if these change without re-creating cy
+  useEffect(() => {
+    if (!ref.current) return
+    if (!showGrid) {
+      ref.current.style.background = '#f7f7f7'
+    } else {
+      const g = gridSize
+      ref.current.style.background = `
+        linear-gradient(to right, rgba(0,0,0,0.06) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(0,0,0,0.06) 1px, transparent 1px),
+        #f7f7f7
+      `
+      ref.current.style.backgroundSize = `${g}px ${g}px, ${g}px ${g}px, auto`
+    }
+  }, [showGrid, gridSize])
 
   return (
     <div
