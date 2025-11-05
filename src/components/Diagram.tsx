@@ -111,6 +111,34 @@ function postCenterParentsVertical(cy: Core) {
   l1.forEach(centerParentOverChildren)
 }
 
+/** Measure text width using canvas with the node’s computed font */
+function measureTextWidth(text: string, fontPx: number, fontFamily = 'Inter, system-ui, Arial, sans-serif') {
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return text.length * fontPx * 0.6 // fallback rough estimate
+  ctx.font = `${Math.max(10, Math.round(fontPx))}px ${fontFamily}`
+  const metrics = ctx.measureText(text)
+  return metrics.width
+}
+
+/** Auto-fit a node’s width (and text wrap width) to its label on demand */
+function autoFitNodeWidth(node: NodeSingular, maxWidth = 720, minWidth = 140, paddingPx = 14) {
+  const label = String(node.data('label') ?? '')
+  if (!label) return
+  // use computed font size if possible
+  const raw = node.style('font-size') as unknown as string | number
+  const fs = typeof raw === 'number' ? raw : (parseFloat(String(raw).replace('px', '')) || 14)
+
+  const w = measureTextWidth(label, fs)
+  // pad a bit more for border/rounding; snap to integer
+  const desired = Math.min(maxWidth, Math.max(minWidth, Math.ceil(w + paddingPx * 2)))
+  // set inline style so global stylesheet updates don’t override
+  node.style({
+    width: desired,
+    'text-max-width': Math.max(40, desired - paddingPx * 2)
+  })
+}
+
 export default function Diagram({
   root,
   onPositionsChange,
@@ -128,7 +156,7 @@ export default function Diagram({
   const ref = useRef<HTMLDivElement>(null)
   const cyRef = useRef<Core | null>(null)
   const roRef = useRef<ResizeObserver | null>(null)
-  const lastTapRef = useRef<{ id: string; at: number } | null>(null)
+  const lastTapRef = useRef<{ id: string; at: number; alt: boolean } | null>(null)
 
   const dragState = useRef<{
     anchorId: string
@@ -198,7 +226,7 @@ export default function Diagram({
   }
 
   /* ──────────────────────────────────────────────────────────────
-     INITIALIZE / REBUILD — only when root or layoutMode changes
+     INITIALIZE / REBUILD — only when root or layoutMode change
      ────────────────────────────────────────────────────────────── */
   useEffect(() => {
     if (!ref.current) return
@@ -211,15 +239,15 @@ export default function Diagram({
       boxSelectionEnabled: true,
       selectionType: 'additive',
       style: [
-        // Base nodes (polished)
+        // Base nodes (polished + stronger drop shadow)
         {
           selector: 'node',
           style: {
             shape: 'round-rectangle',
             label: 'data(label)',
             'text-wrap': 'wrap',
-            'text-max-width': `${textMaxWidth}px`, // initial, will be updated live
-            'font-size': fontSize,                 // initial, will be updated live
+            'text-max-width': `${textMaxWidth}px`, // initial, updated live
+            'font-size': fontSize,                 // initial, updated live
             'text-valign': 'center',
             'text-halign': 'center',
             padding: '14px',
@@ -227,26 +255,26 @@ export default function Diagram({
             'border-color': '#cbd5e1',
             'background-color': '#ffffff',
             'background-opacity': 1,
-            width: boxWidth,                       // initial, will be updated live
-            height: boxHeight,                     // initial, will be updated live
-            'shadow-blur': 18,
-            'shadow-color': 'rgba(15,23,42,0.16)',
+            width: boxWidth,                       // initial, updated live
+            height: boxHeight,                     // initial, updated live
+            'shadow-blur': 22,
+            'shadow-color': 'rgba(15,23,42,0.22)',
             'shadow-opacity': 1,
             'shadow-offset-x': 0,
-            'shadow-offset-y': 4,
+            'shadow-offset-y': 5,
             'corner-rounding': 12
           }
         },
         // Hover & selection polish
-        { selector: 'node:hover', style: { 'border-color': '#2563eb', 'border-width': 2 } },
+        { selector: 'node:hover', style: { 'border-color': '#2563eb', 'border-width': 2, 'shadow-blur': 26, 'shadow-color': 'rgba(37,99,235,0.28)' } },
         {
           selector: 'node:selected',
           style: {
             'border-width': 3,
             'border-color': '#2563eb',
             'background-opacity': 0.98,
-            'shadow-blur': 24,
-            'shadow-color': 'rgba(37,99,235,0.28)'
+            'shadow-blur': 28,
+            'shadow-color': 'rgba(37,99,235,0.35)'
           }
         },
         // Mindmap compact sizing
@@ -432,21 +460,31 @@ export default function Diagram({
     cy.on('dragfree', 'node', endGroupDrag)
     cy.on('free', 'node', endGroupDrag)
 
-    // Double-tap rename
+    // Double-click handler: default = Auto-fit width; Alt/Option + double-click = Rename
     const onTap = (evt: any) => {
       const target = evt.target
       if (!target || target.group?.() !== 'nodes') return
       const id: string = target.id()
       const now = Date.now()
+      // try to read modifier from original event (desktop)
+      const oe: any = evt.originalEvent
+      const alt = !!(oe && oe.altKey)
+
       const last = lastTapRef.current
       if (last && last.id === id && now - last.at < 300) {
+        // double
         lastTapRef.current = null
-        if (!onRename) return
-        const current = String(target.data('label') ?? '')
-        const next = window.prompt('Rename task:', current)
-        if (next && next.trim() && next !== current) onRename(id, next.trim())
+        if (alt && onRename) {
+          const current = String(target.data('label') ?? '')
+          const next = window.prompt('Rename task:', current)
+          if (next && next.trim() && next !== current) onRename(id, next.trim())
+        } else {
+          // default: auto-fit width to text
+          const pad = 14
+          autoFitNodeWidth(target, 720, 140, pad)
+        }
       } else {
-        lastTapRef.current = { id, at: now }
+        lastTapRef.current = { id, at: now, alt }
       }
     }
     cy.on('tap', 'node', onTap)
@@ -535,7 +573,7 @@ export default function Diagram({
     // Draggable
     cy.nodes().forEach(n => { n.grabify() })
 
-    // Resize observer — recenters only on container resize (not on slider changes)
+    // Resize observer — keep size, don’t recenter on slider changes
     if ('ResizeObserver' in window && ref.current) {
       const ro = new ResizeObserver(() => { try { cy.resize() } catch {} })
       ro.observe(ref.current); roRef.current = ro
@@ -551,7 +589,7 @@ export default function Diagram({
       roRef.current?.disconnect(); roRef.current = null
       cy.destroy(); cyRef.current = null
     }
-    // ⚠️ Only rebuild when root or layoutMode change (plus grid toggles)
+    // only rebuild on these:
   }, [root, layoutMode, showGrid, gridSize, snapToGrid])
 
   /* ──────────────────────────────────────────────────────────────
