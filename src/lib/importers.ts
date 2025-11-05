@@ -3,112 +3,102 @@ import Papa from 'papaparse'
 import * as XLSX from 'xlsx'
 
 /**
- * Import an outline from a CSV or Excel file.
- * Expected columns (case-insensitive):  WBS, Name
- * WBS examples: 1, 1.1, 1.2.3  -> indent = number of dots
+ * Normalizes a 2-column table (WBS, Name) into outline text.
  */
-export async function importOutlineFromFile(file: File): Promise<string> {
-  const name = file.name.toLowerCase()
+function rowsToOutline(rows: Array<Record<string, unknown>> | string[][]): string {
+  const out: string[] = []
 
-  if (name.endsWith('.csv')) {
-    const text = await file.text()
-    return outlineFromCsv(text)
+  const asRecords = rows as Array<Record<string, unknown>>
+  const looksLikeRecords =
+    Array.isArray(asRecords) &&
+    asRecords.length > 0 &&
+    typeof asRecords[0] === 'object' &&
+    !Array.isArray(asRecords[0])
+
+  if (looksLikeRecords) {
+    const first = asRecords[0]
+    const keys = Object.keys(first)
+    const findKey = (name: string) => keys.find(k => k.toLowerCase().includes(name))
+    const wbsKey = findKey('wbs') ?? keys[0]
+    const nameKey = findKey('name') ?? keys[1] ?? keys[0]
+
+    for (const r of asRecords) {
+      const wbs = String((r as any)[wbsKey] ?? '').trim()
+      const name = String((r as any)[nameKey] ?? '').trim()
+      if (!wbs && !name) continue
+      const level = wbs ? wbs.split('.').length : 1
+      const indent = '  '.repeat(Math.max(0, level - 1))
+      out.push(`${indent}${name || wbs}`)
+    }
+    return out.join('\n')
   }
 
-  if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
-    const buf = await file.arrayBuffer()
-    return outlineFromXlsx(buf)
+  // Fallback for raw 2D arrays (no headers)
+  const rows2d = rows as string[][]
+  for (const r of rows2d) {
+    const wbs = String(r[0] ?? '').trim()
+    const name = String(r[1] ?? '').trim()
+    if (!wbs && !name) continue
+    const level = wbs ? wbs.split('.').length : 1
+    const indent = '  '.repeat(Math.max(0, level - 1))
+    out.push(`${indent}${name || wbs}`)
   }
-
-  throw new Error('Unsupported file type. Please use .csv, .xlsx, or .xls')
+  return out.join('\n')
 }
 
-// ---------- Helpers ----------
-
-function normalizeKey(k: string): string {
-  return k.trim().toLowerCase().replace(/\s+/g, '')
-}
-
-function findKey(obj: Record<string, any>, target: string): string | null {
-  const want = normalizeKey(target)
-  for (const k of Object.keys(obj)) {
-    if (normalizeKey(k) === want) return k
-  }
-  return null
-}
-
-function toIndentedLine(wbs: string, name: string): string {
-  const trimmedName = String(name ?? '').trim()
-  if (!trimmedName) return ''
-  const dots = (String(wbs ?? '').match(/\./g) || []).length
-  const indent = '  '.repeat(dots) // 2 spaces per level
-  return indent + trimmedName
-}
-
-function outlineFromCsv(csvText: string): string {
-  const parsed = Papa.parse<Record<string, any>>(csvText, {
-    header: true,
-    skipEmptyLines: true,
+/** Parse CSV/TSV text → outline */
+function parseDelimitedToOutline(text: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    Papa.parse<Record<string, unknown>>(text, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (res: Papa.ParseResult<Record<string, unknown>>) => {
+        const data = res.data
+        const hasObjects = Array.isArray(data) && data.some(x => x && typeof x === 'object' && !Array.isArray(x))
+        if (hasObjects && data.length > 0) {
+          resolve(rowsToOutline(data))
+        } else {
+          // reparse without header
+          Papa.parse<string[]>(text, {
+            header: false,
+            skipEmptyLines: true,
+            complete: (res2: Papa.ParseResult<string[]>) => {
+              resolve(rowsToOutline(res2.data as string[][]))
+            },
+            error: (error: Error /* , file: string */) => reject(error)
+          })
+        }
+      },
+      error: (error: Error /* , file: string */) => reject(error)
+    })
   })
-
-  if (parsed.errors?.length) {
-    // Not fatal for all rows; still proceed unless totally broken
-    // console.warn(parsed.errors)
-  }
-
-  const rows = (parsed.data || []).filter(Boolean)
-  if (!rows.length) throw new Error('CSV has no data rows.')
-
-  // Use the first row to detect header keys
-  const sample = rows[0]
-  let wbsKey = findKey(sample, 'wbs')
-  let nameKey = findKey(sample, 'name')
-
-  // fallbacks for header variants
-  if (!nameKey) nameKey = findKey(sample, 'taskname') || findKey(sample, 'title')
-
-  if (!wbsKey || !nameKey) {
-    throw new Error('CSV must contain columns "WBS" and "Name".')
-  }
-
-  const lines: string[] = []
-  for (const r of rows) {
-    const line = toIndentedLine(String(r[wbsKey] ?? ''), String(r[nameKey] ?? ''))
-    if (line) lines.push(line)
-  }
-
-  if (!lines.length) throw new Error('No tasks found in CSV.')
-  return lines.join('\n')
 }
 
-function outlineFromXlsx(buf: ArrayBuffer): string {
+/** Read Excel (xlsx/xls) → outline (first sheet) */
+async function parseExcelToOutline(file: File): Promise<string> {
+  const buf = await file.arrayBuffer()
   const wb = XLSX.read(buf, { type: 'array' })
   const sheetName = wb.SheetNames[0]
-  if (!sheetName) throw new Error('Excel file has no sheets.')
-
+  if (!sheetName) throw new Error('Workbook has no sheets')
   const ws = wb.Sheets[sheetName]
-  const rows = XLSX.utils.sheet_to_json<Record<string, any>>(ws, { defval: '' })
-  if (!rows.length) throw new Error('Excel sheet has no data rows.')
 
-  const sample = rows[0]
-  let wbsKey = findKey(sample, 'wbs')
-  let nameKey = findKey(sample, 'name')
-
-  if (!nameKey) nameKey = findKey(sample, 'taskname') || findKey(sample, 'title')
-
-  if (!wbsKey || !nameKey) {
-    throw new Error('Excel must contain columns "WBS" and "Name".')
+  // Try as objects (header row)
+  const asObjects = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, { defval: '' })
+  if (asObjects && asObjects.length > 0) {
+    return rowsToOutline(asObjects)
   }
 
-  const lines: string[] = []
-  for (const r of rows) {
-    const line = toIndentedLine(String(r[wbsKey] ?? ''), String(r[nameKey] ?? ''))
-    if (line) lines.push(line)
-  }
-
-  if (!lines.length) throw new Error('No tasks found in Excel.')
-  return lines.join('\n')
+  // Fallback: raw rows (no header)
+  const asRows = XLSX.utils.sheet_to_json<string[]>(ws, { header: 1, defval: '' })
+  return rowsToOutline(asRows)
 }
 
-// Also provide default export for convenience
-export default importOutlineFromFile
+/** Public API: File (Excel/CSV/TSV/TXT) → outline string */
+export async function importOutlineFromFile(file: File): Promise<string> {
+  const name = (file.name || '').toLowerCase()
+  if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
+    return parseExcelToOutline(file)
+  }
+  const text = await file.text()
+  return parseDelimitedToOutline(text)
+}

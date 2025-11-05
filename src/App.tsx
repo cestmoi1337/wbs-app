@@ -78,7 +78,7 @@ export default function App() {
     try {
       const input = document.createElement('input')
       input.type = 'file'
-      input.accept = '.csv,.tsv,.txt'
+      input.accept = '.xlsx,.xls,.csv,.tsv,.txt'
       input.onchange = async () => {
         const file = input.files?.[0]
         if (!file) return
@@ -145,7 +145,7 @@ export default function App() {
 
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button onClick={onGenerate}>Generate</button>
-            <button onClick={onImportClick}>Import CSV/TSV</button>
+            <button onClick={onImportClick}>Import Excel/CSV/TSV</button>
           </div>
 
           <div className="label" style={{ marginTop: 4 }}>
