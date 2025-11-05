@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useMemo, useState } from 'react'
 import Diagram, { type LayoutMode } from './components/Diagram'
 import { parseOutline, type WbsNode } from './lib/parseOutline'
-import { importOutlineFromFile } from './lib/importers' // ← named import
+import { importOutlineFromFile } from './lib/importers'
 
+/** Latest sample requested */
 const SAMPLE = `Project
   Initiation
     Develop charter
@@ -21,212 +22,264 @@ const SAMPLE = `Project
     Build Feature C
   Closeout
     Lessons learned 
-    Closing`
+    Closing
+`
 
 type Pos = { x: number; y: number }
 
-export default function App() {
-  const [text, setText] = useState<string>(SAMPLE)
+function renameNode(root: WbsNode, id: string, newLabel: string): WbsNode {
+  if (root.id === id) return { ...root, label: newLabel }
+  const children = root.children?.map(c => renameNode(c, id, newLabel)) ?? []
+  return { ...root, children }
+}
 
+export default function App() {
+  // LEFT INPUT
+  const [inputText, setInputText] = useState<string>(SAMPLE)
+  const [error, setError] = useState<string | null>(null)
+
+  // TREE
+  const [tree, setTree] = useState<WbsNode>(() => parseOutline(SAMPLE))
+  // we only need the setter right now (kept for future “Manual” layout mode)
+  const [, setPositions] = useState<Record<string, Pos>>({})
+
+  // LAYOUT & STYLE CONTROLS
   const [layoutMode, setLayoutMode] = useState<LayoutMode>('horizontal')
   const [fontSize, setFontSize] = useState<number>(14)
   const [boxWidth, setBoxWidth] = useState<number>(240)
-  const [boxHeight, setBoxHeight] = useState<number>(80)
+  const [boxHeight, setBoxHeight] = useState<number>(72)
   const [textMaxWidth, setTextMaxWidth] = useState<number>(220)
 
-  // Grid defaults ON, 10px
+  // GRID
   const [showGrid, setShowGrid] = useState<boolean>(true)
-  const [gridSize, setGridSize] = useState<number>(10)
   const [snapToGrid, setSnapToGrid] = useState<boolean>(true)
+  const [gridSize, setGridSize] = useState<number>(10)
 
-  // Persisted positions
-  const [positions, setPositions] = useState<Record<string, Pos>>(() => {
-    try { return JSON.parse(localStorage.getItem('wbs-positions') || '{}') } catch { return {} }
-  })
-  useEffect(() => { localStorage.setItem('wbs-positions', JSON.stringify(positions)) }, [positions])
-
-  // Force-remount when we want a fresh layout
-  const [diagramKey, setDiagramKey] = useState<number>(0)
-  const remountDiagram = () => setDiagramKey(k => k + 1)
-
-  const tree: WbsNode = useMemo(() => parseOutline(text), [text])
-
+  // Diagram API for export
   const [diagramApi, setDiagramApi] = useState<{
     downloadPNG: (o?: { scale?: number; bg?: string; margin?: number }) => void
     downloadSVG: (o?: { bg?: string; margin?: number }) => void
     fitToScreen: () => void
   } | null>(null)
 
-  // Rename handler
-  const handleRename = (id: string, newLabel: string) => {
-    const lines: string[] = []
-    const walk = (n: WbsNode, depth = 0) => {
-      const label = n.id === id ? newLabel : (n.label ?? '')
-      lines.push(`${'  '.repeat(depth)}${label}`)
-      for (const c of n.children || []) walk(c, depth + 1)
-    }
-    walk(tree, 0)
-    setText(lines.join('\n'))
-  }
-
-  // Reset positions (clear drags)
-  const resetPositions = () => {
-    setPositions({})
-    localStorage.removeItem('wbs-positions')
-    remountDiagram()
-    setTimeout(() => diagramApi?.fitToScreen(), 80)
-  }
-
-  // Import Excel/CSV
-  const fileRef = useRef<HTMLInputElement>(null)
-  const onChooseFile = () => fileRef.current?.click()
-  const onFilePicked: React.ChangeEventHandler<HTMLInputElement> = async (e) => {
-    const f = e.target.files?.[0]
-    if (!f) return
+  // Re-parse when input changes via Generate
+  const onGenerate = () => {
     try {
-      const outline = await importOutlineFromFile(f)
-      if (outline && outline.trim()) {
-        setText(outline)
-        setPositions({})
-        localStorage.removeItem('wbs-positions')
-        remountDiagram()
-        setTimeout(() => diagramApi?.fitToScreen(), 80)
-      } else {
-        alert('Could not parse that file into an outline.')
-      }
-    } catch (err) {
-      console.error(err)
-      alert('Import failed. Please ensure the file has the expected columns or outline.')
-    } finally {
-      if (fileRef.current) fileRef.current.value = ''
+      const t = parseOutline(inputText)
+      setTree(t)
+      setError(null)
+    } catch (e: any) {
+      setError(e?.message || 'Failed to parse outline')
     }
   }
+
+  // Import CSV/TSV/TXT via file picker
+  const onImportClick = async () => {
+    try {
+      const input = document.createElement('input')
+      input.type = 'file'
+      input.accept = '.csv,.tsv,.txt'
+      input.onchange = async () => {
+        const file = input.files?.[0]
+        if (!file) return
+        const text = await importOutlineFromFile(file)
+        setInputText(text)
+        // auto-generate right after import
+        const t = parseOutline(text)
+        setTree(t)
+        setError(null)
+      }
+      input.click()
+    } catch (e: any) {
+      setError(e?.message || 'Failed to import file')
+    }
+  }
+
+  // Rename handler from Diagram
+  const handleRename = (id: string, newLabel: string) => {
+    setTree(prev => renameNode(prev, id, newLabel))
+  }
+
+  // Remount Diagram on mode switch to run a fresh layout
+  const renderKey = useMemo(() => `${layoutMode}`, [layoutMode])
 
   return (
-    <div style={{ height: '100vh', width: '100vw', display: 'flex', overflow: 'hidden', fontFamily: 'Inter, system-ui, Arial, sans-serif' }}>
-      {/* Left: input */}
-      <div style={{ width: 380, borderRight: '1px solid #e5e7eb', display: 'flex', flexDirection: 'column' }}>
-        <div style={{ padding: '12px 12px 8px', borderBottom: '1px solid #f1f5f9' }}>
-          <h2 style={{ margin: 0, fontSize: 16 }}>Project Outline</h2>
-          <p style={{ margin: '6px 0 0', fontSize: 12, color: '#6b7280' }}>
-            Paste an indented outline (spaces denote levels) or import a CSV/Excel file.
-          </p>
-        </div>
-        <textarea
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          spellCheck={false}
-          style={{
-            flex: 1,
-            resize: 'none',
-            border: 'none',
-            outline: 'none',
-            padding: 12,
-            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-            fontSize: 13,
-            lineHeight: 1.4
-          }}
-        />
-        <div style={{ padding: 12, borderTop: '1px solid #f1f5f9', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <button onClick={onChooseFile}>Import Excel/CSV</button>
-          <input
-            ref={fileRef}
-            type="file"
-            accept=".csv,.xlsx,.xls"
-            onChange={onFilePicked}
-            style={{ display: 'none' }}
+    <div
+      style={{
+        height: '100vh',
+        width: '100vw',
+        display: 'flex',
+        gap: 12,
+        padding: 12,
+        background: 'var(--bg)',
+        overflow: 'hidden'
+      }}
+    >
+      {/* Left column: input card */}
+      <div style={{ width: 420, minWidth: 340, maxWidth: 520, height: '100%' }}>
+        <div className="panel" style={{ height: '100%', display: 'flex', flexDirection: 'column', padding: 12, gap: 12 }}>
+          <div style={{ fontWeight: 600 }}>Project Outline</div>
+
+          <div className="label">Paste an indented outline OR a 2-column (WBS, Name) table:</div>
+          <textarea
+            value={inputText}
+            onChange={e => setInputText(e.target.value)}
+            placeholder={`e.g.\nProject\n  Planning\n    Task A\n    Task B\n\nor CSV/TSV with columns:\nWBS\tName\n1\tRoot\n1.1\tChild\n1.1.1\tLeaf`}
+            style={{
+              width: '100%',
+              flex: 1,
+              minHeight: 280,
+              resize: 'none',
+              padding: 10,
+              borderRadius: 8,
+              border: '1px solid var(--border)',
+              lineHeight: 1.4
+            }}
           />
-          <button onClick={resetPositions}>Reset positions</button>
+
+          {error && (
+            <div style={{ color: '#b91c1c', fontSize: 13 }}>
+              {error}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button onClick={onGenerate}>Generate</button>
+            <button onClick={onImportClick}>Import CSV/TSV</button>
+          </div>
+
+          <div className="label" style={{ marginTop: 4 }}>
+            Tip: Double-click a node to rename. Drag a parent to move its entire subtree.
+          </div>
         </div>
       </div>
 
-      {/* Right: diagram + toolbar */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+      {/* Right: toolbar card + diagram card */}
+      <div style={{ flex: 1, height: '100%', display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0 }}>
         {/* Toolbar */}
-        <div
-          style={{
-            padding: 10,
-            display: 'flex',
-            gap: 12,
-            alignItems: 'center',
-            borderBottom: '1px solid #e5e7eb',
-            flexWrap: 'wrap'
-          }}
-        >
-          <label style={{ fontSize: 12 }}>
+        <div className="panel" style={{ padding: 10, display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+          {/* Layout */}
+          <label className="label">
             Layout:&nbsp;
-            <select value={layoutMode} onChange={e => setLayoutMode(e.target.value as LayoutMode)}>
-              <option value="horizontal">Horizontal (LR)</option>
+            <select
+              value={layoutMode}
+              onChange={e => setLayoutMode(e.target.value as LayoutMode)}
+            >
+              <option value="horizontal">Horizontal (Left→Right)</option>
               <option value="vertical">Vertical (Top→Down)</option>
-              <option value="mindmap">Mindmap — Radial</option>
+              <option value="mindmap">Mind map (Radial)</option>
             </select>
           </label>
 
-          <label style={{ fontSize: 12 }}>
-            Font:&nbsp;
-            <input type="range" min={10} max={48} value={fontSize} onChange={e => setFontSize(parseInt(e.target.value, 10))} />
-            &nbsp;{fontSize}px
+          {/* Font size */}
+          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Font:&nbsp;{fontSize}px
+            <input
+              type="range"
+              min={10}
+              max={48}
+              step={1}
+              value={fontSize}
+              onChange={e => setFontSize(parseInt(e.target.value))}
+            />
           </label>
 
-          <label style={{ fontSize: 12 }}>
-            Box W:&nbsp;
-            <input type="range" min={120} max={420} value={boxWidth} onChange={e => setBoxWidth(parseInt(e.target.value, 10))} />
-            &nbsp;{boxWidth}px
+          {/* Box width */}
+          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Box W:&nbsp;{boxWidth}px
+            <input
+              type="range"
+              min={140}
+              max={420}
+              step={10}
+              value={boxWidth}
+              onChange={e => setBoxWidth(parseInt(e.target.value))}
+            />
           </label>
 
-          <label style={{ fontSize: 12 }}>
-            Box H:&nbsp;
-            <input type="range" min={48} max={220} value={boxHeight} onChange={e => setBoxHeight(parseInt(e.target.value, 10))} />
-            &nbsp;{boxHeight}px
+          {/* Box height */}
+          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Box H:&nbsp;{boxHeight}px
+            <input
+              type="range"
+              min={44}
+              max={180}
+              step={4}
+              value={boxHeight}
+              onChange={e => setBoxHeight(parseInt(e.target.value))}
+            />
           </label>
 
-          <label style={{ fontSize: 12 }}>
-            Text wrap:&nbsp;
-            <input type="range" min={120} max={360} value={textMaxWidth} onChange={e => setTextMaxWidth(parseInt(e.target.value, 10))} />
-            &nbsp;{textMaxWidth}px
+          {/* Text wrap width */}
+          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Wrap:&nbsp;{textMaxWidth}px
+            <input
+              type="range"
+              min={120}
+              max={400}
+              step={10}
+              value={textMaxWidth}
+              onChange={e => setTextMaxWidth(parseInt(e.target.value))}
+            />
           </label>
 
-          <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-            <input type="checkbox" checked={showGrid} onChange={e => setShowGrid(e.target.checked)} />
+          {/* Grid */}
+          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input
+              type="checkbox"
+              checked={showGrid}
+              onChange={e => setShowGrid(e.target.checked)}
+            />
             Show grid
           </label>
 
-          <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-            <input type="checkbox" checked={snapToGrid} onChange={e => setSnapToGrid(e.target.checked)} />
+          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input
+              type="checkbox"
+              checked={snapToGrid}
+              onChange={e => setSnapToGrid(e.target.checked)}
+            />
             Snap to grid
           </label>
 
-          <label style={{ fontSize: 12 }}>
-            Grid:&nbsp;
-            <input type="range" min={8} max={64} value={gridSize} onChange={e => setGridSize(parseInt(e.target.value, 10))} />
-            &nbsp;{gridSize}px
+          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Grid:&nbsp;{gridSize}px
+            <input
+              type="range"
+              min={5}
+              max={40}
+              step={1}
+              value={gridSize}
+              onChange={e => setGridSize(parseInt(e.target.value))}
+            />
           </label>
 
-          <button onClick={() => diagramApi?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 80 })}>
-            Download PNG
-          </button>
-          <button onClick={() => diagramApi?.downloadSVG({ margin: 80 })}>
-            Download SVG
-          </button>
+          {/* Actions right side */}
+          <div style={{ flex: 1 }} />
+          <button onClick={() => diagramApi?.fitToScreen()}>Fit</button>
+          <button onClick={() => diagramApi?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 120 })}>PNG</button>
+          <button onClick={() => diagramApi?.downloadSVG({ margin: 120 /* bg omitted = transparent */ })}>SVG</button>
         </div>
 
-        <div style={{ flex: 1, minHeight: 0 }}>
-          <Diagram
-            key={diagramKey}
-            root={tree}
-            positions={positions}
-            onPositionsChange={setPositions}
-            onRename={handleRename}
-            onReady={setDiagramApi}
-            fontSize={fontSize}
-            boxWidth={boxWidth}
-            boxHeight={boxHeight}
-            textMaxWidth={textMaxWidth}
-            layoutMode={layoutMode}
-            showGrid={showGrid}
-            gridSize={gridSize}
-            snapToGrid={snapToGrid}
-          />
+        {/* Diagram card */}
+        <div className="panel" style={{ flex: 1, padding: 10, minHeight: 0 }}>
+          <div style={{ width: '100%', height: '100%' }}>
+            <Diagram
+              key={renderKey}
+              root={tree}
+              onPositionsChange={setPositions}
+              onRename={handleRename}
+              onReady={setDiagramApi}
+              fontSize={fontSize}
+              boxWidth={boxWidth}
+              boxHeight={boxHeight}
+              textMaxWidth={textMaxWidth}
+              layoutMode={layoutMode}
+              showGrid={showGrid}
+              gridSize={gridSize}
+              snapToGrid={snapToGrid}
+            />
+          </div>
         </div>
       </div>
     </div>

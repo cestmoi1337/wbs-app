@@ -21,7 +21,7 @@ type DiagramApi = {
 
 type Props = {
   root: WbsNode
-  positions?: Record<string, Pos>
+  // positions?: Record<string, Pos>   // reserved for a future “Manual” mode
   onPositionsChange?: (p: Record<string, Pos>) => void
   onRename?: (id: string, newLabel: string) => void
   onReady?: (api: DiagramApi) => void
@@ -91,10 +91,10 @@ function toElements(originalRoot: WbsNode) {
   }
   visit(root)
 
-  return { elements: [...nodes, ...edges], nodeIds: nodes.map(n => n.data.id), layoutRootId: root.id, childrenById }
+  return { elements: [...nodes, ...edges], childrenById }
 }
 
-/** Center a parent horizontally over the span of its immediate children */
+/** Center a parent horizontally over the span of its immediate children (vertical layout) */
 function centerParentOverChildren(n: NodeSingular) {
   const kids = n.outgoers('node')
   if (!kids || kids.empty()) return
@@ -114,7 +114,6 @@ function postCenterParentsVertical(cy: Core) {
 
 export default function Diagram({
   root,
-  positions = {},
   onPositionsChange,
   onRename,
   onReady,
@@ -151,11 +150,8 @@ export default function Diagram({
     } catch {}
   }
 
-  // NOTE: layoutRootId no longer needed (mindmap uses cy.nodes().roots())
-  const makeLayout = (cy: Core, canUsePreset: boolean) => {
-    if (layoutMode !== 'mindmap' && canUsePreset) {
-      return cy.layout({ name: 'preset', positions: (n: any) => positions[n.id()] })
-    }
+  // Always compute a layout for each mode (don’t reuse preset positions across modes)
+  const makeLayout = (cy: Core) => {
     if (layoutMode === 'vertical') {
       return cy.layout({
         name: 'elk',
@@ -164,22 +160,17 @@ export default function Diagram({
         elk: {
           algorithm: 'layered',
           'elk.direction': 'DOWN',
-          // spacing
           'elk.layered.spacing.nodeNodeBetweenLayers': 120,
           'elk.spacing.nodeNode': 60,
-          // routing
           'elk.edgeRouting': 'ORTHOGONAL',
           'elk.layered.mergeEdges': true,
-          // try to center (ELK)
           'elk.layered.nodePlacement.strategy': 'BRANDES_KOEPF',
           'elk.layered.nodePlacement.bk.fixedAlignment': 'CENTER'
         }
       } as any)
     }
     if (layoutMode === 'mindmap') {
-      // use actual roots that Cytoscape detects from edges
-      const rootsSel =
-        cy.nodes().roots().map(n => `#${n.id()}`).join(',') || undefined
+      const rootsSel = cy.nodes().roots().map(n => `#${n.id()}`).join(',') || undefined
       return cy.layout({
         name: 'breadthfirst',
         directed: true,
@@ -210,13 +201,7 @@ export default function Diagram({
   useEffect(() => {
     if (!ref.current) return
 
-const { elements, nodeIds, childrenById } = toElements(root)
-
-    const hasAllPositions =
-      nodeIds.length > 0 &&
-      nodeIds.every(id => positions[id] && Number.isFinite(positions[id].x) && Number.isFinite(positions[id].y))
-
-    const usePreset = hasAllPositions && layoutMode !== 'mindmap'
+    const { elements, childrenById } = toElements(root)
 
     const cy = cytoscape({
       container: ref.current,
@@ -224,6 +209,7 @@ const { elements, nodeIds, childrenById } = toElements(root)
       boxSelectionEnabled: true,
       selectionType: 'additive',
       style: [
+        // ── Base nodes (polished)
         {
           selector: 'node',
           style: {
@@ -234,61 +220,93 @@ const { elements, nodeIds, childrenById } = toElements(root)
             'font-size': fontSize,
             'text-valign': 'center',
             'text-halign': 'center',
-            padding: '12px',
+            padding: '14px',
             'border-width': 1,
+            'border-color': '#cbd5e1',          // slate-300
+            'background-color': '#ffffff',
             'background-opacity': 1,
             width: boxWidth,
-            height: boxHeight
+            height: boxHeight,
+            'shadow-blur': 18,
+            'shadow-color': 'rgba(15,23,42,0.16)', // slate-900 @ 16%
+            'shadow-opacity': 1,
+            'shadow-offset-x': 0,
+            'shadow-offset-y': 4,
+            'corner-rounding': 12
           }
         },
-        { selector: 'node:selected', style: { 'border-width': 3, 'border-color': '#2563eb', 'background-opacity': 0.95 } },
+        // Hover & selection polish
+        { selector: 'node:hover', style: { 'border-color': '#2563eb', 'border-width': 2 } },
+        {
+          selector: 'node:selected',
+          style: {
+            'border-width': 3,
+            'border-color': '#2563eb',
+            'background-opacity': 0.98,
+            'shadow-blur': 24,
+            'shadow-color': 'rgba(37,99,235,0.28)'
+          }
+        },
+        // Mindmap compact sizing
         ...(layoutMode === 'mindmap'
           ? [{
               selector: 'node',
               style: {
-                'font-size': Math.max(10, fontSize - 2),
-                'text-max-width': '140px',
-                width: 'mapData(len,   1, 60,  80, 200)',
-                height: 'mapData(lines,1,  6,  36, 100)',
-                padding: '6px'
+                'font-size': Math.max(10, fontSize - 1),
+                'text-max-width': '160px',
+                width: 'mapData(len,   1, 60,  90, 220)',
+                height: 'mapData(lines,1,  6,  40, 110)',
+                padding: '8px'
               }
             } as any]
           : []),
-        { selector: 'node[level = 0]', style: { 'background-color': '#c7d2fe', 'border-color': '#93c5fd' } },
-        { selector: 'node[level = 1]', style: { 'background-color': '#dbeafe', 'border-color': '#93c5fd' } },
-        { selector: 'node[level = 2]', style: { 'background-color': '#dcfce7', 'border-color': '#86efac' } },
-        { selector: 'node[level = 3]', style: { 'background-color': '#fef9c3', 'border-color': '#fde68a' } },
-        { selector: 'node[level = 4]', style: { 'background-color': '#fee2e2', 'border-color': '#fca5a5' } },
-        { selector: 'node[level >= 5]', style: { 'background-color': '#fef9c3', 'border-color': '#fde68a' } },
-        { selector: 'edge', style: { width: 2.5, 'line-opacity': 1, 'line-color': '#94a3b8', 'curve-style': 'bezier' } },
-        { selector: 'edge[level = 1]', style: { width: 3.5 } },
-        ...(layoutMode === 'mindmap'
-          ? [{
-              selector: 'edge',
-              style: {
-                'curve-style': 'unbundled-bezier',
-                'edge-distances': 'node-position',
-                'control-point-distances': 'data(cpd)',
-                'control-point-weights': 0.5
-              }
-            } as any]
-          : []),
-        ...(layoutMode === 'vertical'
-          ? [{
-              selector: 'edge',
-              style: {
-                'curve-style': 'taxi',
-                'taxi-direction': 'downward',
-                'taxi-turn': 20,
-                'taxi-turn-min-distance': 10
-              }
-            } as any]
-          : [])
+        // Level colors (soft fill + stronger border)
+        { selector: 'node[level = 0]', style: { 'background-color': '#eef2ff', 'border-color': '#c7d2fe' } }, // indigo-50/200
+        { selector: 'node[level = 1]', style: { 'background-color': '#dbeafe', 'border-color': '#93c5fd' } }, // blue-100/300
+        { selector: 'node[level = 2]', style: { 'background-color': '#dcfce7', 'border-color': '#86efac' } }, // green-100/300
+        { selector: 'node[level = 3]', style: { 'background-color': '#fef9c3', 'border-color': '#fde68a' } }, // yellow-100/300
+        { selector: 'node[level = 4]', style: { 'background-color': '#fee2e2', 'border-color': '#fca5a5' } }, // red-100/300
+        { selector: 'node[level >= 5]', style: { 'background-color': '#f1f5f9', 'border-color': '#cbd5e1' } }, // slate-100/300
+
+        // Edges (crisper + mode-specific curve)
+        {
+          selector: 'edge',
+          style: {
+            width: 2.5,
+            'line-color': '#94a3b8', // slate-400
+            'line-opacity': 1,
+            'curve-style':
+              layoutMode === 'vertical'
+                ? 'taxi'
+                : layoutMode === 'mindmap'
+                  ? 'unbundled-bezier'
+                  : 'bezier',
+            ...(layoutMode === 'vertical'
+              ? {
+                  'taxi-direction': 'downward',
+                  'taxi-turn': 24,
+                  'taxi-turn-min-distance': 12
+                }
+              : {}),
+            ...(layoutMode === 'mindmap'
+              ? {
+                  'edge-distances': 'node-position',
+                  'control-point-distances': 'data(cpd)',
+                  'control-point-weights': 0.5
+                }
+              : {})
+          }
+        },
+        { selector: 'edge:hover', style: { width: 3.5, 'line-color': '#64748b' } }, // slate-500
+        { selector: 'edge:selected', style: { width: 4, 'line-color': '#2563eb' } },
+
+        // Visual root emphasis (size scaled elsewhere; border stronger here)
+        { selector: 'node.visual-root', style: { 'border-width': 2, 'border-color': '#94a3b8' } }
       ],
       layout: { name: 'preset' }
     })
 
-    // grid background
+    // Grid background on container
     const applyGridBg = () => {
       if (!ref.current) return
       if (!showGrid) { ref.current.style.background = '#f7f7f7'; return }
@@ -326,7 +344,7 @@ const { elements, nodeIds, childrenById } = toElements(root)
     }
 
     const run = () => {
-      const layout = makeLayout(cy, usePreset)
+      const layout = makeLayout(cy)
       if (layoutMode === 'mindmap') { try { cy.reset() } catch {} }
 
       const after = () => {
@@ -349,6 +367,8 @@ const { elements, nodeIds, childrenById } = toElements(root)
     cy.ready(run)
 
     /* ─── drag grouping ─── */
+    const buildDescendants = buildDescendantsGetter(childrenById)
+
     const startGroupDrag = (evt: any) => {
       const t = evt.target
       if (!t || t.group?.() !== 'nodes') return
@@ -358,8 +378,7 @@ const { elements, nodeIds, childrenById } = toElements(root)
       if (sel.nonempty() && sel.filter(`#${id}`).nonempty()) {
         group = sel
       } else {
-        const descendantsOf = buildDescendantsGetter(childrenById)
-        const descIds = descendantsOf(id)
+        const descIds = buildDescendants(id)
         group = cy.collection([t, ...descIds.map(did => cy.getElementById(did))])
       }
       const map = new Map<string, Pos>()
@@ -381,7 +400,7 @@ const { elements, nodeIds, childrenById } = toElements(root)
       cy.endBatch()
     }
 
-    // border-aligned snap-to-grid
+    // Border-aligned snap-to-grid (snap top-left border so borders coincide with grid)
     const snapGroupToGrid = () => {
       if (!dragState.current || !snapToGrid) return
       const z = cy.zoom()
@@ -426,7 +445,7 @@ const { elements, nodeIds, childrenById } = toElements(root)
     cy.on('dragfree', 'node', endGroupDrag)
     cy.on('free', 'node', endGroupDrag)
 
-    // double-tap rename
+    // Double-tap rename
     const onTap = (evt: any) => {
       const target = evt.target
       if (!target || target.group?.() !== 'nodes') return
@@ -445,7 +464,7 @@ const { elements, nodeIds, childrenById } = toElements(root)
     }
     cy.on('tap', 'node', onTap)
 
-    // export API
+    // Export API
     if (onReady) {
       const api: DiagramApi = {
         downloadPNG: ({ scale = 2, bg = '#ffffff', margin = 80 } = {}) => {
@@ -515,7 +534,7 @@ const { elements, nodeIds, childrenById } = toElements(root)
       onReady(api)
     }
 
-    // larger visual root (1.25×)
+    // Larger visual root (1.25×)
     const scale = 1.25
     cy.style()
       .selector('node.visual-root').style({
@@ -528,10 +547,10 @@ const { elements, nodeIds, childrenById } = toElements(root)
       })
       .update()
 
-    // draggable
+    // Make everything draggable
     cy.nodes().forEach(n => { n.grabify() })
 
-    // resize observer
+    // Recenter on container resize
     if ('ResizeObserver' in window && ref.current) {
       const ro = new ResizeObserver(() => { try { cy.resize(); hardCenter(cy, 60) } catch {} })
       ro.observe(ref.current); roRef.current = ro
@@ -547,10 +566,10 @@ const { elements, nodeIds, childrenById } = toElements(root)
       roRef.current?.disconnect(); roRef.current = null
       cy.destroy(); cyRef.current = null
     }
-    // NOTE: do not depend on `positions`; prevents spring-back while dragging
+    // do NOT depend on positions; prevents spring-back while dragging
   }, [root, layoutMode, showGrid, gridSize, snapToGrid, fontSize, boxWidth, boxHeight, textMaxWidth])
 
-  // live style updates (keep root 1.25×)
+  // Live style updates (keep root 1.25× in sync)
   useEffect(() => {
     const cy = cyRef.current; if (!cy) return
     const scale = 1.25
@@ -561,20 +580,20 @@ const { elements, nodeIds, childrenById } = toElements(root)
         'font-size': fontSize,
         width: boxWidth,
         height: boxHeight,
-        padding: '12px'
+        padding: '14px'
       })
       .selector('node.visual-root').style({
         'text-max-width': `${px(textMaxWidth * scale)}px`,
         'font-size': fontSize * scale,
         width: boxWidth * scale,
         height: boxHeight * scale,
-        padding: `${px(12 * scale)}px`,
+        padding: `${px(14 * scale)}px`,
         'border-width': 3
       })
       .update()
   }, [fontSize, boxWidth, boxHeight, textMaxWidth])
 
-  // grid background live updates
+  // Grid background live updates
   useEffect(() => {
     if (!ref.current) return
     if (!showGrid) {
@@ -596,7 +615,7 @@ const { elements, nodeIds, childrenById } = toElements(root)
       style={{
         width: '100%',
         height: '100%',
-        border: '1px solid #ddd',
+        border: '1px solid #e5e7eb',
         overflow: 'hidden',
         position: 'relative',
         background: '#f7f7f7'
