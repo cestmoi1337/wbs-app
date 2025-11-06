@@ -3,7 +3,7 @@ import Diagram, { type LayoutMode } from './components/Diagram'
 import { parseOutline, type WbsNode } from './lib/parseOutline'
 import { importOutlineFromFile } from './lib/importers'
 
-/** Latest sample requested */
+/** Sample */
 const SAMPLE = `Project
   Initiation
     Develop charter
@@ -40,8 +40,10 @@ export default function App() {
 
   // TREE
   const [tree, setTree] = useState<WbsNode>(() => parseOutline(SAMPLE))
-  // we only need the setter right now (kept for future “Manual” layout mode)
-  const [, setPositions] = useState<Record<string, Pos>>({})
+  const [, setPositions] = useState<Record<string, Pos>>({}) // keep for future manual mode
+
+  // TITLE
+  const [title, setTitle] = useState<string>('Work Breakdown Structure')
 
   // LAYOUT & STYLE CONTROLS
   const [layoutMode, setLayoutMode] = useState<LayoutMode>('horizontal')
@@ -55,14 +57,14 @@ export default function App() {
   const [snapToGrid, setSnapToGrid] = useState<boolean>(true)
   const [gridSize, setGridSize] = useState<number>(10)
 
-  // Diagram API for export
+  // Diagram API
   const [diagramApi, setDiagramApi] = useState<{
     downloadPNG: (o?: { scale?: number; bg?: string; margin?: number }) => void
     downloadSVG: (o?: { bg?: string; margin?: number }) => void
     fitToScreen: () => void
+    autoFitAll?: () => void
   } | null>(null)
 
-  // Re-parse when input changes via Generate
   const onGenerate = () => {
     try {
       const t = parseOutline(inputText)
@@ -73,7 +75,6 @@ export default function App() {
     }
   }
 
-  // Import CSV/TSV/TXT via file picker
   const onImportClick = async () => {
     try {
       const input = document.createElement('input')
@@ -84,7 +85,6 @@ export default function App() {
         if (!file) return
         const text = await importOutlineFromFile(file)
         setInputText(text)
-        // auto-generate right after import
         const t = parseOutline(text)
         setTree(t)
         setError(null)
@@ -95,12 +95,10 @@ export default function App() {
     }
   }
 
-  // Rename handler from Diagram
   const handleRename = (id: string, newLabel: string) => {
     setTree(prev => renameNode(prev, id, newLabel))
   }
 
-  // Remount Diagram on mode switch to run a fresh layout
   const renderKey = useMemo(() => `${layoutMode}`, [layoutMode])
 
   return (
@@ -124,7 +122,7 @@ export default function App() {
           <textarea
             value={inputText}
             onChange={e => setInputText(e.target.value)}
-            placeholder={`e.g.\nProject\n  Planning\n    Task A\n    Task B\n\nor CSV/TSV with columns:\nWBS\tName\n1\tRoot\n1.1\tChild\n1.1.1\tLeaf`}
+            placeholder={`e.g.\nProject\n  Planning\n    Task A\n    Task B\n\nor CSV/TSV/Excel with columns:\nWBS\tName\n1\tRoot\n1.1\tChild\n1.1.1\tLeaf`}
             style={{
               width: '100%',
               flex: 1,
@@ -149,15 +147,27 @@ export default function App() {
           </div>
 
           <div className="label" style={{ marginTop: 4 }}>
-            Tip: Double-click a node to rename. Drag a parent to move its entire subtree.
+            Tip: Double-click a node to auto-fit width. Alt+double-click to rename. Shift+double-click resets width.
           </div>
         </div>
       </div>
 
-      {/* Right: toolbar card + diagram card */}
+      {/* Right side */}
       <div style={{ flex: 1, height: '100%', display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0 }}>
         {/* Toolbar */}
         <div className="panel" style={{ padding: 10, display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+          {/* Title */}
+          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Title:&nbsp;
+            <input
+              type="text"
+              value={title}
+              onChange={e => setTitle(e.target.value)}
+              style={{ padding: 6, borderRadius: 8, border: '1px solid var(--border)', minWidth: 240 }}
+              placeholder="Work Breakdown Structure"
+            />
+          </label>
+
           {/* Layout */}
           <label className="label">
             Layout:&nbsp;
@@ -256,9 +266,10 @@ export default function App() {
 
           {/* Actions right side */}
           <div style={{ flex: 1 }} />
+          <button onClick={() => diagramApi?.autoFitAll?.()}>Auto-fit all</button>
           <button onClick={() => diagramApi?.fitToScreen()}>Fit</button>
           <button onClick={() => diagramApi?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 120 })}>PNG</button>
-          <button onClick={() => diagramApi?.downloadSVG({ margin: 120 /* bg omitted = transparent */ })}>SVG</button>
+          <button onClick={() => diagramApi?.downloadSVG({ margin: 120 /* transparent */ })}>SVG</button>
         </div>
 
         {/* Diagram card */}
@@ -266,6 +277,7 @@ export default function App() {
           <div style={{ width: '100%', height: '100%' }}>
             <Diagram
               key={renderKey}
+              title={title}
               root={tree}
               onPositionsChange={setPositions}
               onRename={handleRename}

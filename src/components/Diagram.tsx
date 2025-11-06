@@ -17,10 +17,12 @@ type DiagramApi = {
   downloadPNG: (opts?: { scale?: number; bg?: string; margin?: number }) => void
   downloadSVG: (opts?: { bg?: string; margin?: number }) => void
   fitToScreen: () => void
+  autoFitAll?: () => void
 }
 
 type Props = {
   root: WbsNode
+  title?: string
   onPositionsChange?: (p: Record<string, Pos>) => void
   onRename?: (id: string, newLabel: string) => void
   onReady?: (api: DiagramApi) => void
@@ -125,14 +127,10 @@ function measureTextWidth(text: string, fontPx: number, fontFamily = 'Inter, sys
 function autoFitNodeWidth(node: NodeSingular, maxWidth = 720, minWidth = 140, paddingPx = 14) {
   const label = String(node.data('label') ?? '')
   if (!label) return
-  // use computed font size if possible
   const raw = node.style('font-size') as unknown as string | number
   const fs = typeof raw === 'number' ? raw : (parseFloat(String(raw).replace('px', '')) || 14)
-
   const w = measureTextWidth(label, fs)
-  // pad a bit more for border/rounding; snap to integer
   const desired = Math.min(maxWidth, Math.max(minWidth, Math.ceil(w + paddingPx * 2)))
-  // set inline style so global stylesheet updates don’t override
   node.style({
     width: desired,
     'text-max-width': Math.max(40, desired - paddingPx * 2)
@@ -141,6 +139,7 @@ function autoFitNodeWidth(node: NodeSingular, maxWidth = 720, minWidth = 140, pa
 
 export default function Diagram({
   root,
+  title,
   onPositionsChange,
   onRename,
   onReady,
@@ -153,10 +152,10 @@ export default function Diagram({
   gridSize = 10,
   snapToGrid = true
 }: Props) {
-  const ref = useRef<HTMLDivElement>(null)
+  const ref = useRef<HTMLDivElement>(null)       // cy container
   const cyRef = useRef<Core | null>(null)
   const roRef = useRef<ResizeObserver | null>(null)
-  const lastTapRef = useRef<{ id: string; at: number; alt: boolean } | null>(null)
+  const lastTapRef = useRef<{ id: string; at: number; alt: boolean; shift: boolean } | null>(null)
 
   const dragState = useRef<{
     anchorId: string
@@ -177,7 +176,6 @@ export default function Diagram({
     } catch {}
   }
 
-  // Compute a layout for each mode (no preset reuse across modes)
   const makeLayout = (cy: Core) => {
     if (layoutMode === 'vertical') {
       return cy.layout({
@@ -208,7 +206,6 @@ export default function Diagram({
         animate: false
       } as any)
     }
-    // horizontal (LR)
     return cy.layout({ name: 'dagre', rankDir: 'LR', nodeSep: 60, rankSep: 120 } as any)
   }
 
@@ -225,9 +222,9 @@ export default function Diagram({
     return dfs
   }
 
-  /* ──────────────────────────────────────────────────────────────
-     INITIALIZE / REBUILD — only when root or layoutMode change
-     ────────────────────────────────────────────────────────────── */
+  /* ────────────────────────────────
+     INIT / REBUILD: root or mode
+     ──────────────────────────────── */
   useEffect(() => {
     if (!ref.current) return
 
@@ -239,15 +236,14 @@ export default function Diagram({
       boxSelectionEnabled: true,
       selectionType: 'additive',
       style: [
-        // Base nodes (polished + stronger drop shadow)
         {
           selector: 'node',
           style: {
             shape: 'round-rectangle',
             label: 'data(label)',
             'text-wrap': 'wrap',
-            'text-max-width': `${textMaxWidth}px`, // initial, updated live
-            'font-size': fontSize,                 // initial, updated live
+            'text-max-width': `${textMaxWidth}px`,
+            'font-size': fontSize,
             'text-valign': 'center',
             'text-halign': 'center',
             padding: '14px',
@@ -255,8 +251,8 @@ export default function Diagram({
             'border-color': '#cbd5e1',
             'background-color': '#ffffff',
             'background-opacity': 1,
-            width: boxWidth,                       // initial, updated live
-            height: boxHeight,                     // initial, updated live
+            width: boxWidth,
+            height: boxHeight,
             'shadow-blur': 22,
             'shadow-color': 'rgba(15,23,42,0.22)',
             'shadow-opacity': 1,
@@ -265,19 +261,8 @@ export default function Diagram({
             'corner-rounding': 12
           }
         },
-        // Hover & selection polish
         { selector: 'node:hover', style: { 'border-color': '#2563eb', 'border-width': 2, 'shadow-blur': 26, 'shadow-color': 'rgba(37,99,235,0.28)' } },
-        {
-          selector: 'node:selected',
-          style: {
-            'border-width': 3,
-            'border-color': '#2563eb',
-            'background-opacity': 0.98,
-            'shadow-blur': 28,
-            'shadow-color': 'rgba(37,99,235,0.35)'
-          }
-        },
-        // Mindmap compact sizing
+        { selector: 'node:selected', style: { 'border-width': 3, 'border-color': '#2563eb', 'background-opacity': 0.98, 'shadow-blur': 28, 'shadow-color': 'rgba(37,99,235,0.35)' } },
         ...(layoutMode === 'mindmap'
           ? [{
               selector: 'node',
@@ -290,14 +275,12 @@ export default function Diagram({
               }
             } as any]
           : []),
-        // Level colors
         { selector: 'node[level = 0]', style: { 'background-color': '#eef2ff', 'border-color': '#c7d2fe' } },
         { selector: 'node[level = 1]', style: { 'background-color': '#dbeafe', 'border-color': '#93c5fd' } },
         { selector: 'node[level = 2]', style: { 'background-color': '#dcfce7', 'border-color': '#86efac' } },
         { selector: 'node[level = 3]', style: { 'background-color': '#fef9c3', 'border-color': '#fde68a' } },
         { selector: 'node[level = 4]', style: { 'background-color': '#fee2e2', 'border-color': '#fca5a5' } },
         { selector: 'node[level >= 5]', style: { 'background-color': '#f1f5f9', 'border-color': '#cbd5e1' } },
-        // Edges
         {
           selector: 'edge',
           style: {
@@ -310,31 +293,26 @@ export default function Diagram({
                 : layoutMode === 'mindmap'
                   ? 'unbundled-bezier'
                   : 'bezier',
-            ...(layoutMode === 'vertical'
-              ? {
-                  'taxi-direction': 'downward',
-                  'taxi-turn': 24,
-                  'taxi-turn-min-distance': 12
-                }
-              : {}),
-            ...(layoutMode === 'mindmap'
-              ? {
-                  'edge-distances': 'node-position',
-                  'control-point-distances': 'data(cpd)',
-                  'control-point-weights': 0.5
-                }
-              : {})
+            ...(layoutMode === 'vertical' ? {
+              'taxi-direction': 'downward',
+              'taxi-turn': 24,
+              'taxi-turn-min-distance': 12
+            } : {}),
+            ...(layoutMode === 'mindmap' ? {
+              'edge-distances': 'node-position',
+              'control-point-distances': 'data(cpd)',
+              'control-point-weights': 0.5
+            } : {})
           }
         },
         { selector: 'edge:hover', style: { width: 3.5, 'line-color': '#64748b' } },
         { selector: 'edge:selected', style: { width: 4, 'line-color': '#2563eb' } },
-        // Visual root emphasis
         { selector: 'node.visual-root', style: { 'border-width': 2, 'border-color': '#94a3b8' } }
       ],
       layout: { name: 'preset' }
     })
 
-    // Background grid
+    // grid bg
     const applyGridBg = () => {
       if (!ref.current) return
       if (!showGrid) { ref.current.style.background = '#f7f7f7'; return }
@@ -375,10 +353,7 @@ export default function Diagram({
       if (layoutMode === 'mindmap') { try { cy.reset() } catch {} }
       const after = () => {
         if (layoutMode === 'vertical') {
-          try {
-            postCenterParentsVertical(cy)
-            savePositions()
-          } catch {}
+          try { postCenterParentsVertical(cy); savePositions() } catch {}
         }
         fitAll()
       }
@@ -390,7 +365,7 @@ export default function Diagram({
 
     cy.ready(runLayout)
 
-    /* ─── drag grouping (parent drags descendants) ─── */
+    /* parent drags descendants */
     const buildDescendants = buildDescendantsGetter(childrenById)
 
     const startGroupDrag = (evt: any) => {
@@ -460,36 +435,36 @@ export default function Diagram({
     cy.on('dragfree', 'node', endGroupDrag)
     cy.on('free', 'node', endGroupDrag)
 
-    // Double-click handler: default = Auto-fit width; Alt/Option + double-click = Rename
+    // Double-click: default = auto-fit; Alt = rename; Shift = reset node width
     const onTap = (evt: any) => {
       const target = evt.target
       if (!target || target.group?.() !== 'nodes') return
       const id: string = target.id()
       const now = Date.now()
-      // try to read modifier from original event (desktop)
       const oe: any = evt.originalEvent
       const alt = !!(oe && oe.altKey)
+      const shift = !!(oe && oe.shiftKey)
 
       const last = lastTapRef.current
       if (last && last.id === id && now - last.at < 300) {
-        // double
         lastTapRef.current = null
         if (alt && onRename) {
           const current = String(target.data('label') ?? '')
           const next = window.prompt('Rename task:', current)
           if (next && next.trim() && next !== current) onRename(id, next.trim())
+        } else if (shift) {
+          target.removeStyle('width')
+          target.removeStyle('text-max-width')
         } else {
-          // default: auto-fit width to text
-          const pad = 14
-          autoFitNodeWidth(target, 720, 140, pad)
+          autoFitNodeWidth(target, 720, 140, 14)
         }
       } else {
-        lastTapRef.current = { id, at: now, alt }
+        lastTapRef.current = { id, at: now, alt, shift }
       }
     }
     cy.on('tap', 'node', onTap)
 
-    // Export API
+    // Export API (adds autoFitAll)
     if (onReady) {
       const api: DiagramApi = {
         downloadPNG: ({ scale = 2, bg = '#ffffff', margin = 80 } = {}) => {
@@ -501,8 +476,18 @@ export default function Diagram({
               canvas.width = img.width + margin * 2
               canvas.height = img.height + margin * 2
               const ctx = canvas.getContext('2d')!
+              // bg
               ctx.fillStyle = bg
               ctx.fillRect(0, 0, canvas.width, canvas.height)
+              // title (if any)
+              if (title && title.trim()) {
+                ctx.fillStyle = '#0f172a'
+                ctx.font = '600 20px Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif'
+                ctx.textAlign = 'center'
+                ctx.textBaseline = 'top'
+                ctx.fillText(title.trim(), canvas.width / 2, Math.max(16, margin / 3))
+              }
+              // diagram
               ctx.drawImage(img, margin, margin)
               const out = canvas.toDataURL('image/png')
               const a = document.createElement('a')
@@ -518,9 +503,9 @@ export default function Diagram({
             const parser = new DOMParser()
             const doc = parser.parseFromString(raw, 'image/svg+xml')
             const svgEl = doc.documentElement
+            const viewBoxAttr = svgEl.getAttribute('viewBox')
             const widthAttr = svgEl.getAttribute('width')
             const heightAttr = svgEl.getAttribute('height')
-            const viewBoxAttr = svgEl.getAttribute('viewBox')
             let w = 0, h = 0, vbX = 0, vbY = 0, vbW = 0, vbH = 0
             if (viewBoxAttr) {
               const parts = viewBoxAttr.split(/\s+/).map(Number)
@@ -534,6 +519,8 @@ export default function Diagram({
             svgEl.setAttribute('viewBox', newViewBox)
             svgEl.setAttribute('width', String(newW))
             svgEl.setAttribute('height', String(newH))
+
+            // background
             if (bg) {
               const rect = doc.createElementNS('http://www.w3.org/2000/svg', 'rect')
               rect.setAttribute('x', String(vbX - margin))
@@ -543,6 +530,22 @@ export default function Diagram({
               rect.setAttribute('fill', bg)
               svgEl.insertBefore(rect, svgEl.firstChild)
             }
+
+            // title
+            if (title && title.trim()) {
+              const t = doc.createElementNS('http://www.w3.org/2000/svg', 'text')
+              t.textContent = title.trim()
+              t.setAttribute('x', String(vbX - margin + newW / 2))
+              t.setAttribute('y', String(vbY - margin + Math.max(20, margin / 3)))
+              t.setAttribute('text-anchor', 'middle')
+              t.setAttribute('font-size', '20')
+              t.setAttribute('font-weight', '600')
+              t.setAttribute('fill', '#0f172a')
+              // place title above the (optional) bg rect, or append if none
+              const refNode = svgEl.firstChild ? (svgEl.firstChild as ChildNode).nextSibling : null
+              svgEl.insertBefore(t, refNode)
+            }
+
             const xml = new XMLSerializer().serializeToString(svgEl)
             const blob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' })
             const url = URL.createObjectURL(blob)
@@ -552,7 +555,11 @@ export default function Diagram({
             URL.revokeObjectURL(url)
           } catch {}
         },
-        fitToScreen: () => { try { cy.resize(); hardCenter(cy, 60) } catch {} }
+        fitToScreen: () => { try { cy.resize(); hardCenter(cy, 60) } catch {} },
+        autoFitAll: () => {
+          const pad = 14
+          cy.nodes().forEach(n => autoFitNodeWidth(n, 720, 140, pad))
+        }
       }
       onReady(api)
     }
@@ -570,10 +577,8 @@ export default function Diagram({
       })
       .update()
 
-    // Draggable
     cy.nodes().forEach(n => { n.grabify() })
 
-    // Resize observer — keep size, don’t recenter on slider changes
     if ('ResizeObserver' in window && ref.current) {
       const ro = new ResizeObserver(() => { try { cy.resize() } catch {} })
       ro.observe(ref.current); roRef.current = ro
@@ -589,12 +594,9 @@ export default function Diagram({
       roRef.current?.disconnect(); roRef.current = null
       cy.destroy(); cyRef.current = null
     }
-    // only rebuild on these:
-  }, [root, layoutMode, showGrid, gridSize, snapToGrid])
+  }, [root, layoutMode, showGrid, gridSize, snapToGrid, title])
 
-  /* ──────────────────────────────────────────────────────────────
-     LIVE STYLE UPDATES — no rebuild, no layout, no recenter
-     ────────────────────────────────────────────────────────────── */
+  /* live restyle for sliders */
   useEffect(() => {
     const cy = cyRef.current; if (!cy) return
     const scale = 1.25
@@ -618,7 +620,7 @@ export default function Diagram({
       .update()
   }, [fontSize, boxWidth, boxHeight, textMaxWidth])
 
-  // Live grid background change without rebuild
+  // live grid bg
   useEffect(() => {
     if (!ref.current) return
     if (!showGrid) {
@@ -635,16 +637,39 @@ export default function Diagram({
   }, [showGrid, gridSize])
 
   return (
-    <div
-      ref={ref}
-      style={{
-        width: '100%',
-        height: '100%',
-        border: '1px solid #e5e7eb',
-        overflow: 'hidden',
-        position: 'relative',
-        background: '#f7f7f7'
-      }}
-    />
+    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+      {/* title overlay (onscreen) */}
+      {title && title.trim() && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 6,
+            left: 0,
+            right: 0,
+            textAlign: 'center',
+            zIndex: 2,
+            fontWeight: 600,
+            fontSize: 16,
+            color: '#0f172a',
+            pointerEvents: 'none'
+          }}
+        >
+          {title.trim()}
+        </div>
+      )}
+      {/* cytoscape container */}
+      <div
+        ref={ref}
+        style={{
+          width: '100%',
+          height: '100%',
+          border: '1px solid #e5e7eb',
+          overflow: 'hidden',
+          position: 'absolute',
+          inset: 0,
+          background: '#f7f7f7'
+        }}
+      />
+    </div>
   )
 }
