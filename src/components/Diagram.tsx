@@ -1,13 +1,11 @@
 import cytoscape from 'cytoscape'
 import type { Core, CollectionReturnValue, NodeSingular } from 'cytoscape'
 import dagre from 'cytoscape-dagre'
-import elk from 'cytoscape-elk'
 import svg from 'cytoscape-svg'
 import { useEffect, useRef } from 'react'
 import type { WbsNode } from '../lib/parseOutline'
 
 cytoscape.use(dagre as any)
-cytoscape.use(elk as any)
 cytoscape.use(svg as any)
 
 type Pos = { x: number; y: number }
@@ -95,7 +93,7 @@ function toElements(originalRoot: WbsNode) {
   return { elements: [...nodes, ...edges], childrenById }
 }
 
-/** Center a parent horizontally over the span of its immediate children (vertical layout) */
+/** Center a parent horizontally over the span of its immediate children (for vertical layout polish) */
 function centerParentOverChildren(n: NodeSingular) {
   const kids = n.outgoers('node')
   if (!kids || kids.empty()) return
@@ -113,17 +111,16 @@ function postCenterParentsVertical(cy: Core) {
   l1.forEach(centerParentOverChildren)
 }
 
-/** Measure text width using canvas with the node’s computed font */
+/** Measure text width */
 function measureTextWidth(text: string, fontPx: number, fontFamily = 'Inter, system-ui, Arial, sans-serif') {
   const canvas = document.createElement('canvas')
   const ctx = canvas.getContext('2d')
-  if (!ctx) return text.length * fontPx * 0.6 // fallback
+  if (!ctx) return text.length * fontPx * 0.6
   ctx.font = `${Math.max(10, Math.round(fontPx))}px ${fontFamily}`
-  const metrics = ctx.measureText(text)
-  return metrics.width
+  return ctx.measureText(text).width
 }
 
-/** Auto-fit a node’s width (and text wrap width) to its label on demand */
+/** Auto-fit a node’s width to its label on demand */
 function autoFitNodeWidth(node: NodeSingular, maxWidth = 720, minWidth = 140, paddingPx = 14) {
   const label = String(node.data('label') ?? '')
   if (!label) return
@@ -136,6 +133,18 @@ function autoFitNodeWidth(node: NodeSingular, maxWidth = 720, minWidth = 140, pa
     'text-max-width': Math.max(40, desired - paddingPx * 2)
   })
 }
+
+/* ───────── chevron icons (inline SVG data URIs) ───────── */
+const ICON_SIZE = 18
+const CHEVRON_PADDING = 4 // px from the top-right corner
+const PLUS_SVG = encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${ICON_SIZE}" height="${ICON_SIZE}" viewBox="0 0 24 24" fill="#0f172a"><rect x="1" y="1" width="22" height="22" rx="6" ry="6" fill="#ffffff" stroke="#94a3b8"/><path d="M12 6v12M6 12h12" stroke="#0f172a" stroke-width="2" stroke-linecap="round"/></svg>`
+)
+const MINUS_SVG = encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${ICON_SIZE}" height="${ICON_SIZE}" viewBox="0 0 24 24" fill="#0f172a"><rect x="1" y="1" width="22" height="22" rx="6" ry="6" fill="#ffffff" stroke="#94a3b8"/><path d="M6 12h12" stroke="#0f172a" stroke-width="2" stroke-linecap="round"/></svg>`
+)
+const PLUS_URI = `url("data:image/svg+xml,${PLUS_SVG}")`
+const MINUS_URI = `url("data:image/svg+xml,${MINUS_SVG}")`
 
 export default function Diagram({
   root,
@@ -156,9 +165,11 @@ export default function Diagram({
   const ref = useRef<HTMLDivElement>(null)          // cy container
   const cyRef = useRef<Core | null>(null)
   const roRef = useRef<ResizeObserver | null>(null)
-  const lastTapRef = useRef<{ id: string; at: number; alt: boolean; shift: boolean; meta: boolean; ctrl: boolean } | null>(null)
+  const lastTapRef = useRef<{
+    id: string; at: number; alt: boolean; shift: boolean; meta: boolean; ctrl: boolean
+  } | null>(null)
 
-  // collapse state + tree map available after init
+  // collapse state + map of children
   const collapsedRef = useRef<Set<string>>(new Set())
   const childrenMapRef = useRef<Map<string, string[]>>(new Map())
 
@@ -183,20 +194,12 @@ export default function Diagram({
 
   const makeLayout = (cy: Core) => {
     if (layoutMode === 'vertical') {
+      // OPTION B: Dagre top->bottom tends to keep sibling order
       return cy.layout({
-        name: 'elk',
-        nodeDimensionsIncludeLabels: true,
-        fit: true,
-        elk: {
-          algorithm: 'layered',
-          'elk.direction': 'DOWN',
-          'elk.layered.spacing.nodeNodeBetweenLayers': 120,
-          'elk.spacing.nodeNode': 60,
-          'elk.edgeRouting': 'ORTHOGONAL',
-          'elk.layered.mergeEdges': true,
-          'elk.layered.nodePlacement.strategy': 'BRANDES_KOEPF',
-          'elk.layered.nodePlacement.bk.fixedAlignment': 'CENTER'
-        }
+        name: 'dagre',
+        rankDir: 'TB',
+        nodeSep: 60,
+        rankSep: 120
       } as any)
     }
     if (layoutMode === 'mindmap') {
@@ -211,6 +214,7 @@ export default function Diagram({
         animate: false
       } as any)
     }
+    // horizontal default: Dagre left->right
     return cy.layout({ name: 'dagre', rankDir: 'LR', nodeSep: 60, rankSep: 120 } as any)
   }
 
@@ -232,24 +236,75 @@ export default function Diagram({
     const childrenMap = childrenMapRef.current
     const dfs = buildDescendantsGetter(childrenMap)
     const descIds = dfs(parentId)
-    const nodes = cy.collection(descIds.map(id => cy.getElementById(id))).filter('node')
-    const edges = nodes.connectedEdges().union(cy.getElementById(parentId).connectedEdges().filter(e => descIds.includes(e.target().id())))
+    // Select descendants by a single selector string
+    const selector = descIds.map(id => `#${id}`).join(',')
+    const nodes = selector ? cy.$(selector).filter('node') : cy.collection()
+    const edges = nodes.connectedEdges().union(
+      cy.getElementById(parentId).connectedEdges().filter(e => descIds.includes(e.target().id()))
+    )
     if (collapse) {
       nodes.style('display', 'none')
       edges.style('display', 'none')
       collapsedRef.current.add(parentId)
       cy.getElementById(parentId).addClass('collapsed-parent')
+      setChevronIcon(cy.getElementById(parentId), true)
     } else {
       nodes.style('display', 'element')
       edges.style('display', 'element')
       collapsedRef.current.delete(parentId)
       cy.getElementById(parentId).removeClass('collapsed-parent')
+      setChevronIcon(cy.getElementById(parentId), false)
     }
   }
 
   const toggleCollapsed = (cy: Core, parentId: string) => {
     const isCollapsed = collapsedRef.current.has(parentId)
     setCollapsed(cy, parentId, !isCollapsed)
+  }
+
+  /** Set chevron icon background for a parent node */
+  const setChevronIcon = (node: NodeSingular, collapsed: boolean) => {
+    node.style({
+      'background-image': collapsed ? PLUS_URI : MINUS_URI,
+      'background-width': ICON_SIZE,
+      'background-height': ICON_SIZE,
+      'background-repeat': 'no-repeat',
+      'background-fit': 'none',
+      'background-position-x': '100%',
+      'background-position-y': '0%'
+    })
+  }
+
+  /** Initialize chevrons on all parent nodes */
+  const initChevrons = (cy: Core) => {
+    cy.nodes().forEach(n => {
+      const id = n.id()
+      const hasChildren = (childrenMapRef.current.get(id) || []).length > 0
+      if (hasChildren) {
+        n.addClass('collapsible')
+        setChevronIcon(n, /*collapsed*/ false)
+      } else {
+        n.removeStyle('background-image')
+      }
+    })
+  }
+
+  /** Did a click hit the chevron rect (top-right)? */
+  const hitChevron = (node: NodeSingular, evt: any): boolean => {
+    const bb = node.renderedBoundingBox({ includeOverlays: false })
+    const x = evt.renderedPosition.x
+    const y = evt.renderedPosition.y
+    const right = bb.x2
+    const top = bb.y1
+    const pad = CHEVRON_PADDING
+    const size = ICON_SIZE
+    const rect = {
+      x1: right - pad - size,
+      y1: top + pad,
+      x2: right - pad,
+      y2: top + pad + size
+    }
+    return x >= rect.x1 && x <= rect.x2 && y >= rect.y1 && y <= rect.y2
   }
 
   /* ────────────────────────────────
@@ -295,7 +350,7 @@ export default function Diagram({
         },
         { selector: 'node:hover', style: { 'border-color': '#2563eb', 'border-width': 2, 'shadow-blur': 26, 'shadow-color': 'rgba(37,99,235,0.28)' } },
         { selector: 'node:selected', style: { 'border-width': 3, 'border-color': '#2563eb', 'background-opacity': 0.98, 'shadow-blur': 28, 'shadow-color': 'rgba(37,99,235,0.35)' } },
-        // Marker for collapsed parent
+        // Collapsed marker
         { selector: 'node.collapsed-parent', style: { 'border-style': 'dashed', 'border-color': '#64748b' } },
         // Mindmap compact sizing
         ...(layoutMode === 'mindmap'
@@ -400,7 +455,10 @@ export default function Diagram({
       setTimeout(after, 200)
     }
 
-    cy.ready(runLayout)
+    cy.ready(() => {
+      runLayout()
+      initChevrons(cy) // after layout so sizes are known
+    })
 
     /* parent drags descendants */
     const dfsFactory = buildDescendantsGetter(childrenById)
@@ -472,7 +530,7 @@ export default function Diagram({
     cy.on('dragfree', 'node', endGroupDrag)
     cy.on('free', 'node', endGroupDrag)
 
-    // Double-click: default = auto-fit; Alt = rename; Shift = reset node width; Ctrl/Cmd = collapse/expand
+    // Tap: chevron click first; then double-click shortcuts
     const onTap = (evt: any) => {
       const target = evt.target
       if (!target || target.group?.() !== 'nodes') return
@@ -481,16 +539,22 @@ export default function Diagram({
       const oe: any = evt.originalEvent
       const alt = !!(oe && oe.altKey)
       const shift = !!(oe && oe.shiftKey)
-      const meta = !!(oe && oe.metaKey) // Cmd on Mac
+      const meta = !!(oe && oe.metaKey)
       const ctrl = !!(oe && oe.ctrlKey)
 
+      // Chevron?
+      const isParent = (childrenMapRef.current.get(id) || []).length > 0
+      if (isParent && hitChevron(target, evt)) {
+        toggleCollapsed(cy, id)
+        return
+      }
+
+      // Double-click gestures
       const last = lastTapRef.current
       if (last && last.id === id && now - last.at < 300) {
         lastTapRef.current = null
         if ((meta || ctrl)) {
-          // collapse/expand only if it has children
-          const hasChildren = (childrenMapRef.current.get(id) || []).length > 0
-          if (hasChildren) toggleCollapsed(cy, id)
+          if (isParent) toggleCollapsed(cy, id)
         } else if (alt && onRename) {
           const current = String(target.data('label') ?? '')
           const next = window.prompt('Rename task:', current)
@@ -507,7 +571,7 @@ export default function Diagram({
     }
     cy.on('tap', 'node', onTap)
 
-    // Export API (adds autoFitAll)
+    // Export API
     if (onReady) {
       const api: DiagramApi = {
         downloadPNG: ({ scale = 2, bg = '#ffffff', margin = 80 } = {}) => {
@@ -519,10 +583,8 @@ export default function Diagram({
               canvas.width = img.width + margin * 2
               canvas.height = img.height + margin * 2
               const ctx = canvas.getContext('2d')!
-              // bg
               ctx.fillStyle = bg
               ctx.fillRect(0, 0, canvas.width, canvas.height)
-              // title (if any)
               if (title && title.trim()) {
                 ctx.fillStyle = '#0f172a'
                 ctx.font = '600 20px Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif'
@@ -530,7 +592,6 @@ export default function Diagram({
                 ctx.textBaseline = 'top'
                 ctx.fillText(title.trim(), canvas.width / 2, Math.max(16, margin / 3))
               }
-              // diagram
               ctx.drawImage(img, margin, margin)
               const out = canvas.toDataURL('image/png')
               const a = document.createElement('a')
@@ -562,8 +623,6 @@ export default function Diagram({
             svgEl.setAttribute('viewBox', newViewBox)
             svgEl.setAttribute('width', String(newW))
             svgEl.setAttribute('height', String(newH))
-
-            // background
             if (bg) {
               const rect = doc.createElementNS('http://www.w3.org/2000/svg', 'rect')
               rect.setAttribute('x', String(vbX - margin))
@@ -573,8 +632,6 @@ export default function Diagram({
               rect.setAttribute('fill', bg)
               svgEl.insertBefore(rect, svgEl.firstChild)
             }
-
-            // title (safe insert even if no bg)
             if (title && title.trim()) {
               const t = doc.createElementNS('http://www.w3.org/2000/svg', 'text')
               t.textContent = title.trim()
@@ -587,7 +644,6 @@ export default function Diagram({
               const refNode = svgEl.firstChild ? (svgEl.firstChild as ChildNode).nextSibling : null
               svgEl.insertBefore(t, refNode)
             }
-
             const xml = new XMLSerializer().serializeToString(svgEl)
             const blob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' })
             const url = URL.createObjectURL(blob)
