@@ -117,7 +117,7 @@ function postCenterParentsVertical(cy: Core) {
 function measureTextWidth(text: string, fontPx: number, fontFamily = 'Inter, system-ui, Arial, sans-serif') {
   const canvas = document.createElement('canvas')
   const ctx = canvas.getContext('2d')
-  if (!ctx) return text.length * fontPx * 0.6 // fallback rough estimate
+  if (!ctx) return text.length * fontPx * 0.6 // fallback
   ctx.font = `${Math.max(10, Math.round(fontPx))}px ${fontFamily}`
   const metrics = ctx.measureText(text)
   return metrics.width
@@ -152,10 +152,15 @@ export default function Diagram({
   gridSize = 10,
   snapToGrid = true
 }: Props) {
-  const ref = useRef<HTMLDivElement>(null)       // cy container
+  const containerRef = useRef<HTMLDivElement>(null) // outer wrapper
+  const ref = useRef<HTMLDivElement>(null)          // cy container
   const cyRef = useRef<Core | null>(null)
   const roRef = useRef<ResizeObserver | null>(null)
-  const lastTapRef = useRef<{ id: string; at: number; alt: boolean; shift: boolean } | null>(null)
+  const lastTapRef = useRef<{ id: string; at: number; alt: boolean; shift: boolean; meta: boolean; ctrl: boolean } | null>(null)
+
+  // collapse state + tree map available after init
+  const collapsedRef = useRef<Set<string>>(new Set())
+  const childrenMapRef = useRef<Map<string, string[]>>(new Map())
 
   const dragState = useRef<{
     anchorId: string
@@ -213,13 +218,38 @@ export default function Diagram({
     const cache = new Map<string, string[]>()
     const dfs = (id: string): string[] => {
       if (cache.has(id)) return cache.get(id)!
-      const dir = childrenById.get(id) || []
+      const direct = childrenById.get(id) || []
       const acc: string[] = []
-      for (const c of dir) { acc.push(c); acc.push(...dfs(c)) }
+      for (const c of direct) { acc.push(c); acc.push(...dfs(c)) }
       cache.set(id, acc)
       return acc
     }
     return dfs
+  }
+
+  /** Hide or show all descendants for a parent id */
+  const setCollapsed = (cy: Core, parentId: string, collapse: boolean) => {
+    const childrenMap = childrenMapRef.current
+    const dfs = buildDescendantsGetter(childrenMap)
+    const descIds = dfs(parentId)
+    const nodes = cy.collection(descIds.map(id => cy.getElementById(id))).filter('node')
+    const edges = nodes.connectedEdges().union(cy.getElementById(parentId).connectedEdges().filter(e => descIds.includes(e.target().id())))
+    if (collapse) {
+      nodes.style('display', 'none')
+      edges.style('display', 'none')
+      collapsedRef.current.add(parentId)
+      cy.getElementById(parentId).addClass('collapsed-parent')
+    } else {
+      nodes.style('display', 'element')
+      edges.style('display', 'element')
+      collapsedRef.current.delete(parentId)
+      cy.getElementById(parentId).removeClass('collapsed-parent')
+    }
+  }
+
+  const toggleCollapsed = (cy: Core, parentId: string) => {
+    const isCollapsed = collapsedRef.current.has(parentId)
+    setCollapsed(cy, parentId, !isCollapsed)
   }
 
   /* ────────────────────────────────
@@ -229,6 +259,8 @@ export default function Diagram({
     if (!ref.current) return
 
     const { elements, childrenById } = toElements(root)
+    childrenMapRef.current = childrenById
+    collapsedRef.current.clear()
 
     const cy = cytoscape({
       container: ref.current,
@@ -263,6 +295,9 @@ export default function Diagram({
         },
         { selector: 'node:hover', style: { 'border-color': '#2563eb', 'border-width': 2, 'shadow-blur': 26, 'shadow-color': 'rgba(37,99,235,0.28)' } },
         { selector: 'node:selected', style: { 'border-width': 3, 'border-color': '#2563eb', 'background-opacity': 0.98, 'shadow-blur': 28, 'shadow-color': 'rgba(37,99,235,0.35)' } },
+        // Marker for collapsed parent
+        { selector: 'node.collapsed-parent', style: { 'border-style': 'dashed', 'border-color': '#64748b' } },
+        // Mindmap compact sizing
         ...(layoutMode === 'mindmap'
           ? [{
               selector: 'node',
@@ -275,12 +310,14 @@ export default function Diagram({
               }
             } as any]
           : []),
+        // Level colors
         { selector: 'node[level = 0]', style: { 'background-color': '#eef2ff', 'border-color': '#c7d2fe' } },
         { selector: 'node[level = 1]', style: { 'background-color': '#dbeafe', 'border-color': '#93c5fd' } },
         { selector: 'node[level = 2]', style: { 'background-color': '#dcfce7', 'border-color': '#86efac' } },
         { selector: 'node[level = 3]', style: { 'background-color': '#fef9c3', 'border-color': '#fde68a' } },
         { selector: 'node[level = 4]', style: { 'background-color': '#fee2e2', 'border-color': '#fca5a5' } },
         { selector: 'node[level >= 5]', style: { 'background-color': '#f1f5f9', 'border-color': '#cbd5e1' } },
+        // Edges
         {
           selector: 'edge',
           style: {
@@ -312,7 +349,7 @@ export default function Diagram({
       layout: { name: 'preset' }
     })
 
-    // grid bg
+    // Background grid
     const applyGridBg = () => {
       if (!ref.current) return
       if (!showGrid) { ref.current.style.background = '#f7f7f7'; return }
@@ -366,7 +403,7 @@ export default function Diagram({
     cy.ready(runLayout)
 
     /* parent drags descendants */
-    const buildDescendants = buildDescendantsGetter(childrenById)
+    const dfsFactory = buildDescendantsGetter(childrenById)
 
     const startGroupDrag = (evt: any) => {
       const t = evt.target
@@ -377,7 +414,7 @@ export default function Diagram({
       if (sel.nonempty() && sel.filter(`#${id}`).nonempty()) {
         group = sel
       } else {
-        const descIds = buildDescendants(id)
+        const descIds = dfsFactory(id)
         group = cy.collection([t, ...descIds.map(did => cy.getElementById(did))])
       }
       const map = new Map<string, Pos>()
@@ -435,7 +472,7 @@ export default function Diagram({
     cy.on('dragfree', 'node', endGroupDrag)
     cy.on('free', 'node', endGroupDrag)
 
-    // Double-click: default = auto-fit; Alt = rename; Shift = reset node width
+    // Double-click: default = auto-fit; Alt = rename; Shift = reset node width; Ctrl/Cmd = collapse/expand
     const onTap = (evt: any) => {
       const target = evt.target
       if (!target || target.group?.() !== 'nodes') return
@@ -444,11 +481,17 @@ export default function Diagram({
       const oe: any = evt.originalEvent
       const alt = !!(oe && oe.altKey)
       const shift = !!(oe && oe.shiftKey)
+      const meta = !!(oe && oe.metaKey) // Cmd on Mac
+      const ctrl = !!(oe && oe.ctrlKey)
 
       const last = lastTapRef.current
       if (last && last.id === id && now - last.at < 300) {
         lastTapRef.current = null
-        if (alt && onRename) {
+        if ((meta || ctrl)) {
+          // collapse/expand only if it has children
+          const hasChildren = (childrenMapRef.current.get(id) || []).length > 0
+          if (hasChildren) toggleCollapsed(cy, id)
+        } else if (alt && onRename) {
           const current = String(target.data('label') ?? '')
           const next = window.prompt('Rename task:', current)
           if (next && next.trim() && next !== current) onRename(id, next.trim())
@@ -459,7 +502,7 @@ export default function Diagram({
           autoFitNodeWidth(target, 720, 140, 14)
         }
       } else {
-        lastTapRef.current = { id, at: now, alt, shift }
+        lastTapRef.current = { id, at: now, alt, shift, meta, ctrl }
       }
     }
     cy.on('tap', 'node', onTap)
@@ -531,7 +574,7 @@ export default function Diagram({
               svgEl.insertBefore(rect, svgEl.firstChild)
             }
 
-            // title
+            // title (safe insert even if no bg)
             if (title && title.trim()) {
               const t = doc.createElementNS('http://www.w3.org/2000/svg', 'text')
               t.textContent = title.trim()
@@ -541,7 +584,6 @@ export default function Diagram({
               t.setAttribute('font-size', '20')
               t.setAttribute('font-weight', '600')
               t.setAttribute('fill', '#0f172a')
-              // place title above the (optional) bg rect, or append if none
               const refNode = svgEl.firstChild ? (svgEl.firstChild as ChildNode).nextSibling : null
               svgEl.insertBefore(t, refNode)
             }
@@ -594,9 +636,9 @@ export default function Diagram({
       roRef.current?.disconnect(); roRef.current = null
       cy.destroy(); cyRef.current = null
     }
-  }, [root, layoutMode, showGrid, gridSize, snapToGrid, title])
+  }, [root, layoutMode, showGrid, gridSize, snapToGrid, title, fontSize, boxWidth, boxHeight, textMaxWidth])
 
-  /* live restyle for sliders */
+  /* live restyle for sliders (no rebuild) */
   useEffect(() => {
     const cy = cyRef.current; if (!cy) return
     const scale = 1.25
@@ -637,7 +679,7 @@ export default function Diagram({
   }, [showGrid, gridSize])
 
   return (
-    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+    <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }}>
       {/* title overlay (onscreen) */}
       {title && title.trim() && (
         <div
