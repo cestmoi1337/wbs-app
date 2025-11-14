@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import Diagram, { type LayoutMode } from './components/Diagram'
+import { useMemo, useState, useEffect } from 'react'
+import Diagram, { type LayoutMode, type DiagramApi } from './components/Diagram'
 import { parseOutline, type WbsNode } from './lib/parseOutline'
 import { importOutlineFromFile } from './lib/importers'
 
@@ -25,14 +25,6 @@ const SAMPLE = `Project
     Closing
 `
 
-type Pos = { x: number; y: number }
-
-function renameNode(root: WbsNode, id: string, newLabel: string): WbsNode {
-  if (root.id === id) return { ...root, label: newLabel }
-  const children = root.children?.map(c => renameNode(c, id, newLabel)) ?? []
-  return { ...root, children }
-}
-
 export default function App() {
   // LEFT INPUT
   const [inputText, setInputText] = useState<string>(SAMPLE)
@@ -40,7 +32,6 @@ export default function App() {
 
   // TREE
   const [tree, setTree] = useState<WbsNode>(() => parseOutline(SAMPLE))
-  const [, setPositions] = useState<Record<string, Pos>>({}) // keep for future manual mode
 
   // TITLE
   const [title, setTitle] = useState<string>('Work Breakdown Structure')
@@ -58,17 +49,15 @@ export default function App() {
   const [gridSize, setGridSize] = useState<number>(10)
 
   // Diagram API
-  const [diagramApi, setDiagramApi] = useState<{
-    downloadPNG: (o?: { scale?: number; bg?: string; margin?: number }) => void
-    downloadSVG: (o?: { bg?: string; margin?: number }) => void
-    fitToScreen: () => void
-    autoFitAll?: () => void
-  } | null>(null)
+  const [diagramApi, setDiagramApi] = useState<DiagramApi | null>(null)
 
   const onGenerate = () => {
     try {
       const t = parseOutline(inputText)
       setTree(t)
+      // Auto-title from root label
+      const auto = (t.label || 'Work Breakdown Structure').trim()
+      setTitle(auto)
       setError(null)
     } catch (e: any) {
       setError(e?.message || 'Failed to parse outline')
@@ -87,6 +76,9 @@ export default function App() {
         setInputText(text)
         const t = parseOutline(text)
         setTree(t)
+        // Auto-title on import too
+        const auto = (t.label || 'Work Breakdown Structure').trim()
+        setTitle(auto)
         setError(null)
       }
       input.click()
@@ -96,8 +88,33 @@ export default function App() {
   }
 
   const handleRename = (id: string, newLabel: string) => {
-    setTree(prev => renameNode(prev, id, newLabel))
+    setTree(prev => {
+      const rename = (n: WbsNode): WbsNode =>
+        n.id === id ? { ...n, label: newLabel } : { ...n, children: (n.children || []).map(rename) }
+      return rename(prev)
+    })
   }
+
+  // Keyboard shortcuts: Undo / Redo, routed to Diagram
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!diagramApi) return
+      const meta = e.metaKey || e.ctrlKey
+      if (!meta) return
+      // Undo: Cmd/Ctrl+Z (no Shift)
+      if (e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault()
+        diagramApi.undo?.()
+      }
+      // Redo: Cmd/Ctrl+Shift+Z or Cmd/Ctrl+Y
+      if ((e.key.toLowerCase() === 'z' && e.shiftKey) || e.key.toLowerCase() === 'y') {
+        e.preventDefault()
+        diagramApi.redo?.()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [diagramApi])
 
   const renderKey = useMemo(() => `${layoutMode}`, [layoutMode])
 
@@ -147,7 +164,12 @@ export default function App() {
           </div>
 
           <div className="label" style={{ marginTop: 4 }}>
-            Tip: Double-click a node to auto-fit width. Alt+double-click to rename. Shift+double-click resets width.
+            Tips: Double-click = auto-fit width. Alt+Double-click = rename. Shift+Double-click = reset width.
+          </div>
+          <div className="label">
+            Collapse/expand with chevron (+/−) or Cmd/Ctrl+Double-click.  
+            Undo/Redo: Cmd/Ctrl+Z / Cmd/Ctrl+Shift+Z.  
+            Move selected with Arrow keys (Shift for 10×).
           </div>
         </div>
       </div>
@@ -270,6 +292,8 @@ export default function App() {
           <button onClick={() => diagramApi?.fitToScreen()}>Fit</button>
           <button onClick={() => diagramApi?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 120 })}>PNG</button>
           <button onClick={() => diagramApi?.downloadSVG({ margin: 120 /* transparent */ })}>SVG</button>
+          <button onClick={() => diagramApi?.undo?.()}>Undo</button>
+          <button onClick={() => diagramApi?.redo?.()}>Redo</button>
         </div>
 
         {/* Diagram card */}
@@ -279,7 +303,6 @@ export default function App() {
               key={renderKey}
               title={title}
               root={tree}
-              onPositionsChange={setPositions}
               onRename={handleRename}
               onReady={setDiagramApi}
               fontSize={fontSize}
