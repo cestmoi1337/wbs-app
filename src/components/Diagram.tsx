@@ -1,365 +1,953 @@
-// src/components/Diagram.tsx
-import { useEffect, useMemo, useRef } from 'react'
 import cytoscape from 'cytoscape'
-import type { Core, ElementDefinition, Position } from 'cytoscape'
+import type { Core, CollectionReturnValue, NodeSingular } from 'cytoscape'
 import dagre from 'cytoscape-dagre'
+import svg from 'cytoscape-svg'
+import { useEffect, useRef } from 'react'
+import type { WbsNode } from '../lib/parseOutline'
 
-cytoscape.use(dagre)
+cytoscape.use(dagre as any)
+cytoscape.use(svg as any)
 
-// Enable Manhattan edges safely (no endpoints)
-const ADVANCED_EDGES = true
-
-// ===== Public types =====
+type Pos = { x: number; y: number }
 export type LayoutMode = 'horizontal' | 'vertical' | 'mindmap'
 
 export type DiagramApi = {
-  cy: Core
   downloadPNG: (opts?: { scale?: number; bg?: string; margin?: number }) => void
   downloadSVG: (opts?: { bg?: string; margin?: number }) => void
-  autoFitAll: (padding?: number) => void
-  fitToScreen: (padding?: number) => void
-  undo: () => void
-  redo: () => void
+  exportJSON: () => string
+  importJSON: (json: string) => void
+  fitToScreen: () => void
+  autoFitAll?: () => void
+  undo?: () => void
+  redo?: () => void
 }
 
-export type WbsNode = {
-  id: string
-  label: string
-  children?: WbsNode[]
-}
-
-// ===== Props =====
 type Props = {
   root: WbsNode
-  layoutMode: LayoutMode
-  fontSize: number
-  boxWidth: number
-  boxHeight: number
-  textMaxWidth: number
-  showGrid?: boolean
-  snapToGrid?: boolean
-  gridSize?: number
   title?: string
+  onRename?: (id: string, newLabel: string) => void
   onReady?: (api: DiagramApi) => void
-  onRename?: (id: string, label: string) => void // accepted but not used here
+  fontSize?: number
+  boxWidth?: number
+  boxHeight?: number
+  textMaxWidth?: number
+  layoutMode?: LayoutMode
+  showGrid?: boolean
+  gridSize?: number
+  snapToGrid?: boolean
 }
 
-// ===== helpers =====
-const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n))
-const safeNum = (v: unknown, fallback: number) => {
-  const n = Number(v)
-  return Number.isFinite(n) ? n : fallback
-}
-const toPx = (v: unknown, fallback: number) => `${Math.max(0, safeNum(v, fallback))}px`
-const roundTo = (v: number, step: number) => Math.round(v / step) * step
+/* ───────────────── helpers ───────────────── */
 
-type Snapshot = Record<string, Position>
-
-const takeSnapshot = (cy: Core): Snapshot => {
-  const map: Snapshot = {}
-  cy.nodes().forEach((n) => { map[n.id()] = { ...n.position() } })
-  return map
+function getVisualRoot(node: WbsNode): WbsNode {
+  const label = (node.label ?? '').trim().toLowerCase()
+  if (label === 'root' && (node.children?.length ?? 0) === 1) return node.children![0]
+  return node
 }
-const applySnapshot = (cy: Core, snap: Snapshot) => {
-  cy.startBatch()
-  Object.entries(snap).forEach(([id, p]) => {
-    const n = cy.getElementById(id)
-    if (n.nonempty()) n.position(p)
+
+function toElements(originalRoot: WbsNode) {
+  const root = getVisualRoot(originalRoot)
+  const nodes: any[] = []
+  const edges: any[] = []
+
+  // visual root
+  {
+    const lbl = root.label ?? ''
+    nodes.push({
+      data: {
+        id: root.id,
+        label: lbl,
+        level: root.level ?? 0,
+        len: lbl.length,
+        lines: Math.max(1, Math.ceil(lbl.length / 18))
+      },
+      classes: 'visual-root'
+    })
+  }
+
+  const pushChild = (n: WbsNode) => {
+    const lbl = n.label ?? ''
+    nodes.push({
+      data: {
+        id: n.id,
+        label: lbl,
+        level: n.level ?? 0,
+        len: lbl.length,
+        lines: Math.max(1, Math.ceil(lbl.length / 18))
+      }
+    })
+  }
+
+  const visit = (n: WbsNode) => {
+    for (const c of n.children || []) {
+      pushChild(c)
+      const lvl = c.level ?? 0
+      const cpd = 60 + lvl * 30
+      edges.push({ data: { id: `${n.id}-${c.id}`, source: n.id, target: c.id, level: lvl, cpd } })
+      visit(c)
+    }
+  }
+  visit(root)
+
+  return { elements: [...nodes, ...edges] }
+}
+
+/** For vertical layout: center parent over span of its immediate children */
+function centerParentOverChildren(n: NodeSingular) {
+  const kids = n.outgoers('node')
+  if (!kids || kids.empty()) return
+  const bb = kids.boundingBox()
+  const y = n.position('y')
+  const cx = bb.x1 + bb.w / 2
+  n.position({ x: cx, y })
+}
+function postCenterParentsVertical(cy: Core) {
+  const roots = cy.nodes().roots()
+  roots.forEach(centerParentOverChildren)
+  const l1 = roots.outgoers('node')
+  l1.forEach(centerParentOverChildren)
+}
+
+/** Measure text width */
+function measureTextWidth(text: string, fontPx: number, fontFamily = 'Inter, system-ui, Arial, sans-serif') {
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return text.length * fontPx * 0.6
+  ctx.font = `${Math.max(10, Math.round(fontPx))}px ${fontFamily}`
+  return ctx.measureText(text).width
+}
+
+/** Auto-fit a node’s width to its label on demand */
+function autoFitNodeWidth(node: NodeSingular, maxWidth = 720, minWidth = 140, paddingPx = 14) {
+  const label = String(node.data('label') ?? '')
+  if (!label) return
+  const raw = node.style('font-size') as unknown as string | number
+  const fs = typeof raw === 'number' ? raw : (parseFloat(String(raw).replace('px', '')) || 14)
+  const w = measureTextWidth(label, fs)
+  const desired = Math.min(maxWidth, Math.max(minWidth, Math.ceil(w + paddingPx * 2)))
+  node.style({
+    width: desired,
+    'text-max-width': Math.max(40, desired - paddingPx * 2)
+  } as any)
+}
+
+/* chevrons */
+const ICON_SIZE = 18
+const CHEVRON_PADDING = 4
+const PLUS_SVG = encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${ICON_SIZE}" height="${ICON_SIZE}" viewBox="0 0 24 24" fill="#0f172a"><rect x="1" y="1" width="22" height="22" rx="6" ry="6" fill="#ffffff" stroke="#94a3b8"/><path d="M12 6v12M6 12h12" stroke="#0f172a" stroke-width="2" stroke-linecap="round"/></svg>`
+)
+const MINUS_SVG = encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${ICON_SIZE}" height="${ICON_SIZE}" viewBox="0 0 24 24" fill="#0f172a"><rect x="1" y="1" width="22" height="22" rx="6" ry="6" fill="#ffffff" stroke="#94a3b8"/><path d="M6 12h12" stroke="#0f172a" stroke-width="2" stroke-linecap="round"/></svg>`
+)
+const PLUS_URI = `url("data:image/svg+xml,${PLUS_SVG}")`
+const MINUS_URI = `url("data:image/svg+xml,${MINUS_SVG}")`
+
+function setChevronIcon(node: NodeSingular, collapsed: boolean) {
+  node.style({
+    'background-image': collapsed ? PLUS_URI : MINUS_URI,
+    'background-width': ICON_SIZE,
+    'background-height': ICON_SIZE,
+    'background-repeat': 'no-repeat',
+    'background-fit': 'none',
+    'background-position-x': '100%',
+    'background-position-y': '0%'
+  } as any)
+}
+
+/* snapshot / history */
+type Snapshot = {
+  positions: Record<string, Pos>
+  labels: Record<string, string>
+  styles: Record<string, { width?: number; textMaxWidth?: number }>
+  collapsed: string[]
+}
+
+const toNumOrUndef = (v: unknown) => {
+  const n = parseFloat(String(v))
+  return Number.isFinite(n) ? n : undefined
+}
+
+function snapshot(cy: Core): Snapshot {
+  const positions: Record<string, Pos> = {}
+  const labels: Record<string, string> = {}
+  const styles: Record<string, { width?: number; textMaxWidth?: number }> = {}
+  cy.nodes().forEach(n => {
+    const p = n.position()
+    positions[n.id()] = { x: p.x, y: p.y }
+    labels[n.id()] = String(n.data('label') ?? '')
+    const w = toNumOrUndef(n.style('width') as any)
+    const tw = toNumOrUndef(n.style('text-max-width') as any)
+    if (w !== undefined || tw !== undefined) styles[n.id()] = { width: w, textMaxWidth: tw }
   })
+  const collapsed: string[] = []
+  cy.nodes('.collapsed-parent').forEach(n => { collapsed.push(n.id()) })
+  return { positions, labels, styles, collapsed }
+}
+
+function applySnapshot(cy: Core, s: Snapshot) {
+  cy.startBatch()
+  for (const [id, pos] of Object.entries(s.positions)) {
+    const n = cy.getElementById(id)
+    if (n.nonempty()) n.position(pos)
+  }
+  for (const [id, lbl] of Object.entries(s.labels)) {
+    const n = cy.getElementById(id)
+    if (n.nonempty()) n.data('label', lbl)
+  }
+  cy.nodes().forEach(n => {
+    const st = s.styles[n.id()]
+    if (st) {
+      if (st.width !== undefined) n.style('width', st.width as any)
+      else n.removeStyle('width')
+      if (st.textMaxWidth !== undefined) n.style('text-max-width', st.textMaxWidth as any)
+      else n.removeStyle('text-max-width')
+    } else {
+      n.removeStyle('width')
+      n.removeStyle('text-max-width')
+    }
+  })
+  cy.nodes().removeClass('collapsed-parent')
+  cy.nodes().style('display', 'element')
+  if (s.collapsed?.length) {
+    s.collapsed.forEach(id => {
+      const n = cy.getElementById(id)
+      if (n.nonempty()) {
+        n.addClass('collapsed-parent')
+        setCollapsedInternal(cy, id, true)
+      }
+    })
+  }
   cy.endBatch()
 }
 
-function toElements(
-  root: WbsNode,
-  layout: LayoutMode,
-  boxW: number,
-  boxH: number
-): { elements: ElementDefinition[] } {
-  const els: ElementDefinition[] = []
-  const walk = (node: WbsNode, level: number, parent?: WbsNode) => {
-    els.push({
-      data: { id: node.id, label: node.label, level },
-      style: { width: boxW, height: boxH }
-    })
-    if (parent) {
-      // No endpoints here (they caused the crash)
-      els.push({ data: { id: `${parent.id}-${node.id}`, source: parent.id, target: node.id } })
-    }
-    node.children?.forEach((c) => walk(c, level + 1, node))
+/* collapse helpers used by snapshot restore */
+function setCollapsedInternal(cy: Core, parentId: string, collapse: boolean) {
+  const node = cy.getElementById(parentId)
+  if (node.empty()) return
+  const desc = node.successors('node')
+  const edges = node.successors('edge')
+  if (collapse) {
+    desc.style('display', 'none')
+    edges.style('display', 'none')
+    setChevronIcon(node, true)
+  } else {
+    desc.style('display', 'element')
+    edges.style('display', 'element')
+    setChevronIcon(node, false)
   }
-  walk(root, 0)
-  return { elements: els }
 }
 
-function makeLayout(layout: LayoutMode) {
-  if (layout === 'vertical') {
-    return { name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 90, edgeSep: 18, fit: true } as any
-  }
-  if (layout === 'mindmap') {
-    return { name: 'dagre', rankDir: 'LR', nodeSep: 40, rankSep: 120, edgeSep: 16, spacingFactor: 1, fit: true } as any
-  }
-  return { name: 'dagre', rankDir: 'LR', nodeSep: 60, rankSep: 110, edgeSep: 24, fit: true } as any
+/* JSON export/import */
+function exportJSONFrom(cy: Core, meta: {
+  title?: string,
+  layoutMode: string,
+  fontSize: number,
+  boxWidth: number,
+  boxHeight: number,
+  textMaxWidth: number,
+  showGrid: boolean,
+  gridSize: number,
+  snapToGrid: boolean
+}) {
+  const s = snapshot(cy)
+  const nodes = cy.nodes().map(n => ({
+    id: n.id(),
+    label: String(n.data('label') ?? ''),
+    level: Number(n.data('level') ?? 0),
+    pos: s.positions[n.id()],
+    width: parseFloat(String(n.style('width') as any)) || undefined,
+    wrap: parseFloat(String(n.style('text-max-width') as any)) || undefined,
+    collapsed: n.hasClass('collapsed-parent') || undefined
+  }))
+  const edges = cy.edges().map(e => ({ source: e.source().id(), target: e.target().id() }))
+
+  return JSON.stringify({
+    meta: { version: 1, ...meta },
+    nodes, edges
+  }, null, 2)
 }
+
+function importJSONInto(cy: Core, json: string) {
+  const data = JSON.parse(json)
+  if (Array.isArray(data.nodes)) {
+    data.nodes.forEach((n: any) => {
+      const ele = cy.getElementById(n.id)
+      if (ele.nonempty()) {
+        if (n.label != null) ele.data('label', n.label)
+        if (n.pos) ele.position(n.pos)
+        if (n.width != null) ele.style('width', n.width as any)
+        if (n.wrap != null) ele.style('text-max-width', n.wrap as any)
+        if (n.collapsed) ele.addClass('collapsed-parent')
+      }
+    })
+  }
+  cy.nodes('.collapsed-parent').forEach(n => setCollapsedInternal(cy, n.id(), true))
+}
+
+/* ───────────────── component ───────────────── */
 
 export default function Diagram({
   root,
-  layoutMode,
-  fontSize,
-  boxWidth,
-  boxHeight,
-  textMaxWidth,
-  showGrid = true,
-  snapToGrid = true,
-  gridSize = 10,
   title,
-  onReady
+  onRename,
+  onReady,
+  fontSize = 12,
+  boxWidth = 240,
+  boxHeight = 72,
+  textMaxWidth = 220,
+  layoutMode = 'horizontal',
+  showGrid = true,
+  gridSize = 10,
+  snapToGrid = true
 }: Props) {
-  const containerRef = useRef<HTMLDivElement | null>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const ref = useRef<HTMLDivElement>(null)
   const cyRef = useRef<Core | null>(null)
+  const roRef = useRef<ResizeObserver | null>(null)
 
-  const undoStack = useRef<Snapshot[]>([])
-  const redoStack = useRef<Snapshot[]>([])
-  const dragStartSnap = useRef<Snapshot | null>(null)
+  const lastTapRef = useRef<{
+    id: string; at: number; alt: boolean; shift: boolean; meta: boolean; ctrl: boolean
+  } | null>(null)
 
-  const safeBoxW = safeNum(boxWidth, 240)
-  const safeBoxH = safeNum(boxHeight, 72)
-  const safeFont = clamp(safeNum(fontSize, 14), 8, 64)
-  const safeTmwPx = toPx(textMaxWidth, 220)
-  const safeGrid = safeNum(gridSize, 10)
+  // drag group state
+  const dragState = useRef<{
+    anchorId: string
+    initialAnchor: Pos
+    group: Map<string, Pos>
+    prevSnap?: Snapshot
+  } | null>(null)
 
-  const { elements } = useMemo(
-    () => toElements(root, layoutMode, safeBoxW, safeBoxH),
-    [root, layoutMode, safeBoxW, safeBoxH]
-  )
+  // history
+  const undoRef = useRef<Snapshot[]>([])
+  const redoRef = useRef<Snapshot[]>([])
+  const historyLimit = 50
+
+  const pushUndo = (before: Snapshot) => {
+    undoRef.current.push(before)
+    if (undoRef.current.length > historyLimit) undoRef.current.shift()
+    redoRef.current = []
+  }
+
+  const doUndo = () => {
+    const cy = cyRef.current
+    if (!cy || undoRef.current.length === 0) return
+    const current = snapshot(cy)
+    const prev = undoRef.current.pop()!
+    redoRef.current.push(current)
+    applySnapshot(cy, prev)
+  }
+  const doRedo = () => {
+    const cy = cyRef.current
+    if (!cy || redoRef.current.length === 0) return
+    const current = snapshot(cy)
+    const next = redoRef.current.pop()!
+    undoRef.current.push(current)
+    applySnapshot(cy, next)
+  }
+
+  const hardCenter = (cy: Core, padding = 60) => {
+    try {
+      const bb = cy.elements().boundingBox()
+      const w = cy.width(), h = cy.height()
+      if (!w || !h || !isFinite(bb.w) || !isFinite(bb.h) || bb.w === 0 || bb.h === 0) return
+      const zoom = Math.max(0.02, Math.min(w / (bb.w + padding * 2), h / (bb.h + padding * 2)))
+      const cx = bb.x1 + bb.w / 2
+      const cyy = bb.y1 + bb.h / 2
+      cy.zoom(zoom)
+      cy.pan({ x: w / 2 - cx * zoom, y: h / 2 - cyy * zoom })
+    } catch {}
+  }
+
+  const makeLayout = (cy: Core) => {
+    if (layoutMode === 'vertical') {
+      return cy.layout({ name: 'dagre', rankDir: 'TB', nodeSep: 60, rankSep: 120 } as any)
+    }
+    if (layoutMode === 'mindmap') {
+      const rootsSel = cy.nodes().roots().map(n => `#${n.id()}`).join(',') || undefined
+      return cy.layout({
+        name: 'breadthfirst',
+        directed: true,
+        roots: rootsSel,
+        circle: true,
+        spacingFactor: 1.6,
+        avoidOverlap: true,
+        animate: false
+      } as any)
+    }
+    return cy.layout({ name: 'dagre', rankDir: 'LR', nodeSep: 60, rankSep: 120 } as any)
+  }
+
+  const hitChevron = (node: NodeSingular, evt: any): boolean => {
+    const bb = node.renderedBoundingBox({ includeOverlays: false })
+    const x = evt.renderedPosition.x
+    const y = evt.renderedPosition.y
+    const right = bb.x2
+    const top = bb.y1
+    const pad = CHEVRON_PADDING
+    const size = ICON_SIZE
+    const rect = { x1: right - pad - size, y1: top + pad, x2: right - pad, y2: top + pad + size }
+    return x >= rect.x1 && x <= rect.x2 && y >= rect.y1 && y <= rect.y2
+  }
 
   useEffect(() => {
-    const el = containerRef.current
-    if (!el) return
+    if (!ref.current) return
 
-    cyRef.current?.destroy()
+    const { elements } = toElements(root)
 
-    // grid background
-    el.style.background = showGrid
-      ? `linear-gradient(to right, #eef2f6 1px, transparent 1px),
-         linear-gradient(to bottom, #eef2f6 1px, transparent 1px)`
-      : 'transparent'
-    el.style.backgroundSize = `${safeGrid}px ${safeGrid}px`
+    undoRef.current = []
+    redoRef.current = []
 
     const cy = cytoscape({
-      container: el,
+      container: ref.current,
       elements,
-      wheelSensitivity: 0.35,
-      pixelRatio: 1,
-      layout: makeLayout(layoutMode),
+      boxSelectionEnabled: true,
+      selectionType: 'additive',
       style: [
-        // Nodes
         {
           selector: 'node',
           style: {
             shape: 'round-rectangle',
             label: 'data(label)',
             'text-wrap': 'wrap',
-            'text-max-width': safeTmwPx,
-            'font-size': safeFont,
+            'text-max-width': `${textMaxWidth}px`,
+            'font-size': fontSize,
             'text-valign': 'center',
             'text-halign': 'center',
-            padding: 12,
-            width: safeBoxW,
-            height: safeBoxH,
-            'background-color': '#ffffff',
+            padding: '14px',
             'border-width': 1,
-            'border-color': '#cbd5e1'
+            'border-color': '#cbd5e1',
+            'background-color': '#ffffff',
+            'background-opacity': 1,
+            width: boxWidth,
+            height: boxHeight,
+            'shadow-blur': 22,
+            'shadow-color': 'rgba(15,23,42,0.22)',
+            'shadow-opacity': 1,
+            'shadow-offset-x': 0,
+            'shadow-offset-y': 5,
+            'corner-rounding': 12
           } as any
         },
-        { selector: 'node[level = 0]', style: { 'background-color': '#e6eefc', 'border-color': '#93c5fd', 'border-width': 2 } as any },
-        { selector: 'node[level = 1]', style: { 'background-color': '#e0f2fe' } as any },
-        { selector: 'node[level = 2]', style: { 'background-color': '#dcfce7' } as any },
-        { selector: 'node[level = 3]', style: { 'background-color': '#fef9c3' } as any },
-        { selector: 'node[level >= 4]', style: { 'background-color': '#f1f5f9' } as any },
-        { selector: 'node:selected', style: { 'border-width': 3, 'border-color': '#2563eb' } as any },
+        { selector: 'node:hover', style: { 'border-color': '#2563eb', 'border-width': 2, 'shadow-blur': 26, 'shadow-color': 'rgba(37,99,235,0.28)' } as any },
+        { selector: 'node:selected', style: { 'border-width': 3, 'border-color': '#2563eb', 'background-opacity': 0.98, 'shadow-blur': 28, 'shadow-color': 'rgba(37,99,235,0.35)' } as any },
+        { selector: 'node.collapsed-parent', style: { 'border-style': 'dashed', 'border-color': '#64748b' } as any },
+        ...(layoutMode === 'mindmap'
+          ? [{
+              selector: 'node',
+              style: {
+                'font-size': Math.max(10, fontSize - 1),
+                'text-max-width': '160px',
+                width: 'mapData(len,   1, 60,  90, 220)',
+                height: 'mapData(lines,1,  6,  40, 110)',
+                padding: '8px'
+              } as any
+            }]
+          : []),
+        { selector: 'node[level = 0]', style: { 'background-color': '#eef2ff', 'border-color': '#c7d2fe' } as any },
+        { selector: 'node[level = 1]', style: { 'background-color': '#dbeafe', 'border-color': '#93c5fd' } as any },
+        { selector: 'node[level = 2]', style: { 'background-color': '#dcfce7', 'border-color': '#86efac' } as any },
+        { selector: 'node[level = 3]', style: { 'background-color': '#fef9c3', 'border-color': '#fde68a' } as any },
+        { selector: 'node[level = 4]', style: { 'background-color': '#fee2e2', 'border-color': '#fca5a5' } as any },
+        { selector: 'node[level >= 5]', style: { 'background-color': '#f1f5f9', 'border-color': '#cbd5e1' } as any },
 
-        // Edges (Manhattan without endpoints)
+        // ── Edge styling (elbows that meet the node border; no stubs) ──
         {
           selector: 'edge',
           style: {
             width: 2.5,
             'line-color': '#94a3b8',
             'line-opacity': 1,
-            'curve-style': ADVANCED_EDGES ? 'taxi' : 'bezier',
-            ...(ADVANCED_EDGES
-              ? {
-                  'taxi-direction': layoutMode === 'vertical' ? 'downward' : 'horizontal',
-                  'taxi-turn': 14,
-                  'taxi-turn-min-distance': 0,
-                  'edge-distances': 'intersection',
-                  'line-cap': 'round'
-                }
-              : {})
+
+            'curve-style': layoutMode === 'mindmap' ? 'unbundled-bezier' : 'taxi',
+
+            ...(layoutMode !== 'mindmap' ? {
+              'taxi-direction': layoutMode === 'vertical' ? 'downward' : 'horizontal',
+              'taxi-turn': 20,
+              'taxi-turn-min-distance': 12,
+
+              // Key: run elbows to the node border (remove gaps)
+              'taxi-source-distance': 0,
+              'taxi-target-distance': 0,
+              'taxi-endpoint': 'node',              // fallback if needed: 'node-position'
+              'edge-distances': 'intersection'
+            } : {}),
+
+            'line-cap': 'square',
+            'line-join': 'miter'
           } as any
-        }
-      ]
+        },
+        { selector: 'edge:hover', style: { width: 3.5, 'line-color': '#64748b' } as any },
+        { selector: 'edge:selected', style: { width: 4, 'line-color': '#2563eb' } as any },
+
+        { selector: 'node.visual-root', style: { 'border-width': 2, 'border-color': '#94a3b8' } as any }
+      ],
+      layout: { name: 'preset' }
     })
 
-    // Run initial layout explicitly
-    const lay = cy.layout(makeLayout(layoutMode))
-    lay.run()
+    // grid background
+    const applyGridBg = () => {
+      if (!ref.current) return
+      if (!showGrid) { ref.current.style.background = '#f7f7f7'; return }
+      const g = gridSize
+      ref.current.style.background = `
+        linear-gradient(to right, rgba(0,0,0,0.06) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(0,0,0,0.06) 1px, transparent 1px),
+        #f7f7f7
+      `
+      ref.current.style.backgroundSize = `${g}px ${g}px, ${g}px ${g}px, auto`
+    }
+    applyGridBg()
 
-    // Mindmap: mirror every other immediate child subtree to the LEFT of the root
-    if (layoutMode === 'mindmap') {
-      const rootNode = cy.nodes('[level = 0]').first()
-      if (rootNode.nonempty()) {
-        const rootId = rootNode.id()
-        const rootX = rootNode.position('x')
-        const children = cy.edges(`[source = "${rootId}"]`).targets()
-        children.forEach((child, idx) => {
-          const placeLeft = idx % 2 === 1
-          if (!placeLeft) return
-          const subtree = child.union(child.successors())
-          const GAP = 40
-          cy.startBatch()
-          subtree.nodes().positions((n) => {
-            const p = n.position()
-            const dx = p.x - rootX
-            return { x: rootX - dx - GAP, y: p.y }
-          })
-          cy.endBatch()
-        })
-        cy.center(rootNode)
-      }
+    const fitAll = () => {
+      try {
+        cy.resize()
+        const bb = cy.elements().boundingBox()
+        if (isFinite(bb.w) && isFinite(bb.h) && bb.w > 0 && bb.h > 0) {
+          const w = cy.width(), h = cy.height()
+          const zoom = Math.max(0.02, Math.min(w / (bb.w + 120), h / (bb.h + 120)))
+          const cx = bb.x1 + bb.w / 2
+          const cyy = bb.y1 + bb.h / 2
+          cy.zoom(zoom)
+          cy.pan({ x: w / 2 - cx * zoom, y: h / 2 - cyy * zoom })
+        }
+      } catch {}
     }
 
-    // history + snap-to-grid
-    cy.on('grab', 'node', () => { dragStartSnap.current = takeSnapshot(cy) })
-    cy.on('dragfree', 'node', (evt) => {
-      if (snapToGrid) {
-        const n = evt.target
-        const p = n.position()
-        n.position({ x: roundTo(p.x, safeGrid), y: roundTo(p.y, safeGrid) })
+    const makeLayoutAndRun = () => {
+      const layout = makeLayout(cy)
+      if (layoutMode === 'mindmap') { try { cy.reset() } catch {} }
+      const after = () => {
+        if (layoutMode === 'vertical') {
+          try { postCenterParentsVertical(cy) } catch {}
+        }
+        fitAll()
       }
-      const before = dragStartSnap.current
-      const after = takeSnapshot(cy)
-      dragStartSnap.current = null
-      if (before) {
-        undoStack.current.push(before)
-        redoStack.current = []
-      }
-      undoStack.current.push(after)
+      cy.one('layoutstop', after)
+      layout.run()
+      setTimeout(after, 50)
+      setTimeout(after, 200)
+    }
+
+    cy.ready(() => {
+      makeLayoutAndRun()
+
+      // Init chevrons on parents
+      cy.nodes().forEach(n => {
+        const hasChildren = n.outgoers('node').nonempty()
+        if (hasChildren) {
+          n.addClass('collapsible')
+          setChevronIcon(n, n.hasClass('collapsed-parent'))
+        } else {
+          n.removeStyle('background-image')
+        }
+      })
+
+      // seed history
+      undoRef.current = [snapshot(cy)]
+      redoRef.current = []
     })
 
-    cy.minZoom(0.3)
-    cy.maxZoom(2.5)
+    /* parent drags descendants + snap + history */
+    const startGroupDrag = (evt: any) => {
+      const t = evt.target
+      if (!t || t.group?.() !== 'nodes') return
+      const id = t.id()
+      const sel = cy.$('node:selected')
+      let group: CollectionReturnValue
+      if (sel.nonempty() && sel.filter(`#${id}`).nonempty()) {
+        group = sel
+      } else {
+        const desc = t.successors('node')
+        group = cy.collection([t]).union(desc)
+      }
+      const map = new Map<string, Pos>()
+      group.forEach(n => { const p = n.position(); map.set(n.id(), { x: p.x, y: p.y }) })
+      dragState.current = { anchorId: id, initialAnchor: { ...t.position() }, group: map, prevSnap: snapshot(cy) }
+    }
+
+    const onDragMove = (evt: any) => {
+      const st = dragState.current
+      if (!st) return
+      const t = evt.target
+      if (!t || t.group?.() !== 'nodes' || t.id() !== st.anchorId) return
+      const now = t.position()
+      const dx = now.x - st.initialAnchor.x
+      const dy = now.y - st.initialAnchor.y
+      cy.startBatch()
+      for (const [nid, pos] of st.group.entries()) {
+        if (nid === st.anchorId) continue
+        cy.getElementById(nid).position({ x: pos.x + dx, y: pos.y + dy })
+      }
+      cy.endBatch()
+    }
+
+    const snapToGridNow = (eles: CollectionReturnValue) => {
+      if (!snapToGrid) return
+      const z = cy.zoom()
+      const pan = cy.pan()
+      const step = gridSize
+      cy.startBatch()
+      eles.forEach(ele => {
+        const p = ele.position()
+        const sx = p.x * z + pan.x
+        const sy = p.y * z + pan.y
+        const halfW = ele.renderedWidth() / 2
+        const halfH = ele.renderedHeight() / 2
+        const left = sx - halfW
+        const top = sy - halfH
+        const left2 = Math.round(left / step) * step
+        const top2 = Math.round(top / step) * step
+        const sx2 = left2 + halfW
+        const sy2 = top2 + halfH
+        ele.position({ x: (sx2 - pan.x) / z, y: (sy2 - pan.y) / z })
+      })
+      cy.endBatch()
+    }
+
+    const endGroupDrag = () => {
+      const st = dragState.current
+      if (!st) return
+      const ids = Array.from(st.group.keys())
+      const selector = ids.map(i => `#${i}`).join(',')
+      const eles = selector ? cy.$(selector) : cy.collection()
+      snapToGridNow(eles)
+      if (st.prevSnap) pushUndo(st.prevSnap)
+      dragState.current = null
+    }
+
+    cy.on('grab', 'node', startGroupDrag)
+    cy.on('drag', 'node', onDragMove)
+    cy.on('dragfree', 'node', endGroupDrag)
+    cy.on('free', 'node', endGroupDrag)
+
+    // Tap: chevron click & double-click shortcuts
+    const onTap = (evt: any) => {
+      const target = evt.target
+      if (!target || target.group?.() !== 'nodes') return
+      const id: string = target.id()
+      const now = Date.now()
+      const oe: any = evt.originalEvent
+      const alt = !!(oe && oe.altKey)
+      const shift = !!(oe && oe.shiftKey)
+      const meta = !!(oe && oe.metaKey)
+      const ctrl = !!(oe && oe.ctrlKey)
+
+      // Chevron?
+      const isParent = target.outgoers('node').nonempty()
+      if (isParent && hitChevron(target, evt)) {
+        const before = snapshot(cy)
+        const collapsed = target.hasClass('collapsed-parent')
+        if (collapsed) {
+          target.removeClass('collapsed-parent')
+          setCollapsedInternal(cy, id, false)
+        } else {
+          target.addClass('collapsed-parent')
+          setCollapsedInternal(cy, id, true)
+        }
+        pushUndo(before)
+        return
+      }
+
+      // Double-click gestures
+      const last = lastTapRef.current
+      if (last && last.id === id && now - last.at < 300) {
+        lastTapRef.current = null
+        if ((meta || ctrl)) {
+          const before = snapshot(cy)
+          const collapsed = target.hasClass('collapsed-parent')
+          if (collapsed) {
+            target.removeClass('collapsed-parent')
+            setCollapsedInternal(cy, id, false)
+          } else {
+            target.addClass('collapsed-parent')
+            setCollapsedInternal(cy, id, true)
+          }
+          pushUndo(before)
+        } else if (alt && onRename) {
+          const current = String(target.data('label') ?? '')
+          const next = window.prompt('Rename task:', current)
+          if (next && next.trim() && next !== current) {
+            const before = snapshot(cy)
+            onRename(id, next.trim())
+            target.data('label', next.trim())
+            pushUndo(before)
+          }
+        } else if (shift) {
+          const before = snapshot(cy)
+          target.removeStyle('width')
+          target.removeStyle('text-max-width')
+          pushUndo(before)
+        } else {
+          const before = snapshot(cy)
+          autoFitNodeWidth(target, 720, 140, 14)
+          pushUndo(before)
+        }
+      } else {
+        lastTapRef.current = { id, at: now, alt, shift, meta, ctrl }
+      }
+    }
+    cy.on('tap', 'node', onTap)
+
+    // Keyboard nudge (arrow keys)
+    const keyHandler = (e: KeyboardEvent) => {
+      const hasFocus =
+        document.activeElement &&
+        (document.activeElement.tagName === 'INPUT' ||
+          document.activeElement.tagName === 'TEXTAREA' ||
+          (document.activeElement as HTMLElement).isContentEditable)
+      if (hasFocus) return
+
+      const arrows = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']
+      if (!arrows.includes(e.key)) return
+      const sel = cy.$('node:selected')
+      if (sel.empty()) return
+      e.preventDefault()
+      const base = gridSize || 10
+      const step = e.shiftKey ? base * 10 : base
+      const dx = e.key === 'ArrowLeft' ? -step : e.key === 'ArrowRight' ? step : 0
+      const dy = e.key === 'ArrowUp' ? -step : e.key === 'ArrowDown' ? step : 0
+      const before = snapshot(cy)
+      cy.startBatch()
+      sel.forEach(n => {
+        const p = n.position()
+        n.position({ x: p.x + dx, y: p.y + dy })
+      })
+      cy.endBatch()
+      if (snapToGrid) {
+        const selector = sel.map(n => `#${n.id()}`).join(',')
+        const eles = selector ? cy.$(selector) : cy.collection()
+        const z = cy.zoom()
+        const pan = cy.pan()
+        const stepPx = gridSize
+        cy.startBatch()
+        eles.forEach(ele => {
+          const p = ele.position()
+          const sx = p.x * z + pan.x
+          const sy = p.y * z + pan.y
+          const halfW = ele.renderedWidth() / 2
+          const halfH = ele.renderedHeight() / 2
+          const left = sx - halfW
+          const top = sy - halfH
+          const left2 = Math.round(left / stepPx) * stepPx
+          const top2 = Math.round(top / stepPx) * stepPx
+          const sx2 = left2 + halfW
+          const sy2 = top2 + halfH
+          ele.position({ x: (sx2 - pan.x) / z, y: (sy2 - pan.y) / z })
+        })
+        cy.endBatch()
+      }
+      pushUndo(before)
+    }
+    window.addEventListener('keydown', keyHandler)
+
+    // Export API
+    if (onReady) {
+      const api: DiagramApi = {
+        downloadPNG: ({ scale = 2, bg = '#ffffff', margin = 80 } = {}) => {
+          try {
+            const tight = cy.png({ full: true, scale, bg })
+            const img = new Image()
+            img.onload = () => {
+              const canvas = document.createElement('canvas')
+              canvas.width = img.width + margin * 2
+              canvas.height = img.height + margin * 2
+              const ctx = canvas.getContext('2d')!
+              ctx.fillStyle = bg
+              ctx.fillRect(0, 0, canvas.width, canvas.height)
+              if (title && title.trim()) {
+                ctx.fillStyle = '#0f172a'
+                ctx.font = '600 20px Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif'
+                ctx.textAlign = 'center'
+                ctx.textBaseline = 'top'
+                ctx.fillText(title.trim(), canvas.width / 2, Math.max(16, margin / 3))
+              }
+              ctx.drawImage(img, margin, margin)
+              const out = canvas.toDataURL('image/png')
+              const a = document.createElement('a')
+              a.href = out; a.download = 'wbs.png'
+              document.body.appendChild(a); a.click(); a.remove()
+            }
+            img.src = tight
+          } catch {}
+        },
+        downloadSVG: ({ bg, margin = 80 } = {}) => {
+          try {
+            const raw = (cy as any).svg({ full: true }) as string
+            const parser = new DOMParser()
+            const doc = parser.parseFromString(raw, 'image/svg+xml')
+            const svgEl = doc.documentElement
+            const viewBoxAttr = svgEl.getAttribute('viewBox')
+            const widthAttr = svgEl.getAttribute('width')
+            const heightAttr = svgEl.getAttribute('height')
+            let w = 0, h = 0, vbX = 0, vbY = 0, vbW = 0, vbH = 0
+            if (viewBoxAttr) {
+              const parts = viewBoxAttr.split(/\s+/).map(Number)
+              ;[vbX, vbY, vbW, vbH] = parts; w = vbW; h = vbH
+            } else if (widthAttr && heightAttr) {
+              w = parseFloat(widthAttr); h = parseFloat(heightAttr)
+              svgEl.setAttribute('viewBox', `0 0 ${w} ${h}`); vbW = w; vbH = h
+            }
+            const newW = w + margin * 2, newH = h + margin * 2
+            const newViewBox = `${vbX - margin} ${vbY - margin} ${newW} ${newH}`
+            svgEl.setAttribute('viewBox', newViewBox)
+            svgEl.setAttribute('width', String(newW))
+            svgEl.setAttribute('height', String(newH))
+            if (bg) {
+              const rect = doc.createElementNS('http://www.w3.org/2000/svg', 'rect')
+              rect.setAttribute('x', String(vbX - margin))
+              rect.setAttribute('y', String(vbY - margin))
+              rect.setAttribute('width', String(newW))
+              rect.setAttribute('height', String(newH))
+              rect.setAttribute('fill', bg)
+              svgEl.insertBefore(rect, svgEl.firstChild)
+            }
+            if (title && title.trim()) {
+              const t = doc.createElementNS('http://www.w3.org/2000/svg', 'text')
+              t.textContent = title.trim()
+              t.setAttribute('x', String(vbX - margin + newW / 2))
+              t.setAttribute('y', String(vbY - margin + Math.max(20, margin / 3)))
+              t.setAttribute('text-anchor', 'middle')
+              t.setAttribute('font-size', '20')
+              t.setAttribute('font-weight', '600')
+              t.setAttribute('fill', '#0f172a')
+              const refNode = svgEl.firstChild ? (svgEl.firstChild as ChildNode).nextSibling : null
+              svgEl.insertBefore(t, refNode)
+            }
+            const xml = new XMLSerializer().serializeToString(svgEl)
+            const blob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' })
+            const url = URL.createObjectURL(blob)
+            const a = document.createElement('a')
+            a.href = url; a.download = 'wbs.svg'
+            document.body.appendChild(a); a.click(); a.remove()
+            URL.revokeObjectURL(url)
+          } catch {}
+        },
+        exportJSON: () =>
+          exportJSONFrom(cy, {
+            title,
+            layoutMode,
+            fontSize, boxWidth, boxHeight, textMaxWidth,
+            showGrid, gridSize, snapToGrid
+          }),
+        importJSON: (json: string) => {
+          const before = snapshot(cy)
+          importJSONInto(cy, json)
+          pushUndo(before)
+          cy.resize()
+        },
+        fitToScreen: () => { try { cy.resize(); hardCenter(cy, 60) } catch {} },
+        autoFitAll: () => {
+          const pad = 14
+          cy.nodes().forEach(n => autoFitNodeWidth(n, 720, 140, pad))
+        },
+        undo: doUndo,
+        redo: doRedo
+      }
+      onReady(api)
+    }
+
+    // Bigger visual root (1.25×)
+    const scale = 1.25
+    cy.style()
+      .selector('node.visual-root').style({
+        'text-max-width': `${Math.round(textMaxWidth * scale)}px`,
+        'font-size': fontSize * scale,
+        width: boxWidth * scale,
+        height: boxHeight * scale,
+        padding: `${Math.round(14 * scale)}px`,
+        'border-width': 3
+      } as any)
+      .update()
+
+    cy.nodes().forEach(n => { n.grabify() })
+
+    if ('ResizeObserver' in window && ref.current) {
+      const ro = new ResizeObserver(() => { try { cy.resize() } catch {} })
+      ro.observe(ref.current); roRef.current = ro
+    }
 
     cyRef.current = cy
-
-    const api: DiagramApi = {
-      cy,
-      downloadPNG: (userOpts) => {
-        const options: any = {
-          output: 'blob',
-          scale: userOpts?.scale ?? 2,
-          bg: userOpts?.bg ?? '#ffffff',
-          full: true
-        }
-        if (typeof userOpts?.margin === 'number') options.padding = userOpts.margin
-        const blob = (cy as any).png(options) as Blob
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a')
-        a.href = url
-        a.download = 'wbs.png'
-        a.click()
-        URL.revokeObjectURL(url)
-      },
-      downloadSVG: (userOpts) => {
-        const hasSvg = typeof (cy as any).svg === 'function'
-        if (!hasSvg) return
-        const options: any = { full: true, bg: userOpts?.bg }
-        if (typeof userOpts?.margin === 'number') options.padding = userOpts.margin
-        const svgStr: string = (cy as any).svg(options)
-        const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' })
-        const url = URL.createObjectURL(svgStr ? blob : new Blob())
-        const a = document.createElement('a')
-        a.href = url
-        a.download = 'wbs.svg'
-        a.click()
-        URL.revokeObjectURL(url)
-      },
-      autoFitAll: (padding = 40) => { cy.fit(undefined, padding) },
-      fitToScreen: (padding = 40) => { cy.fit(undefined, padding) },
-      undo: () => {
-        if (undoStack.current.length < 2) return
-        const current = undoStack.current.pop()!
-        const target = undoStack.current.pop()!
-        redoStack.current.push(current)
-        redoStack.current.push(takeSnapshot(cy))
-        applySnapshot(cy, target)
-      },
-      redo: () => {
-        if (redoStack.current.length < 1) return
-        const target = redoStack.current.pop()!
-        undoStack.current.push(takeSnapshot(cy))
-        applySnapshot(cy, target)
-      }
-    }
-
-    onReady?.(api)
-
     return () => {
       cy.destroy()
       cyRef.current = null
-      undoStack.current = []
-      redoStack.current = []
-      dragStartSnap.current = null
+      roRef.current?.disconnect(); roRef.current = null
+      window.getSelection?.()?.removeAllRanges?.()
     }
-  }, [
-    elements,
-    layoutMode,
-    safeFont,
-    safeBoxW,
-    safeBoxH,
-    safeTmwPx,
-    showGrid,
-    snapToGrid,
-    safeGrid,
-    onReady
-  ])
+  }, [root, layoutMode, showGrid, gridSize, snapToGrid, title, fontSize, boxWidth, boxHeight, textMaxWidth])
 
-  // live style updates
+  // live restyle for sliders
   useEffect(() => {
-    const cy = cyRef.current
-    if (!cy) return
-    cy.nodes().style({
-      width: safeNum(boxWidth, 240),
-      height: safeNum(boxHeight, 72),
-      'font-size': clamp(safeNum(fontSize, 14), 8, 64),
-      'text-max-width': toPx(textMaxWidth, 220)
-    } as any)
-    if (ADVANCED_EDGES) {
-      cy.edges().style({
-        'taxi-direction': layoutMode === 'vertical' ? 'downward' : 'horizontal'
+    const cy = cyRef.current; if (!cy) return
+    const scale = 1.25
+    const px = (n: number) => Math.round(n)
+    cy.style()
+      .selector('node').style({
+        'text-max-width': `${textMaxWidth}px`,
+        'font-size': fontSize,
+        width: boxWidth,
+        height: boxHeight,
+        padding: '14px'
       } as any)
+      .selector('node.visual-root').style({
+        'text-max-width': `${px(textMaxWidth * scale)}px`,
+        'font-size': fontSize * scale,
+        width: boxWidth * scale,
+        height: boxHeight * scale,
+        padding: `${px(14 * scale)}px`,
+        'border-width': 3
+      } as any)
+      .update()
+  }, [fontSize, boxWidth, boxHeight, textMaxWidth])
+
+  // live grid bg
+  useEffect(() => {
+    if (!ref.current) return
+    if (!showGrid) {
+      ref.current.style.background = '#f7f7f7'
+    } else {
+      const g = gridSize
+      ref.current.style.background = `
+        linear-gradient(to right, rgba(0,0,0,0.06) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(0,0,0,0.06) 1px, transparent 1px),
+        #f7f7f7
+      `
+      ref.current.style.backgroundSize = `${g}px ${g}px, ${g}px ${g}px, auto`
     }
-  }, [boxWidth, boxHeight, fontSize, textMaxWidth, layoutMode])
+  }, [showGrid, gridSize])
 
   return (
-    <div style={{ position: 'relative', height: '100%', width: '100%' }}>
-      {title ? (
+    <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }}>
+      {title && title.trim() && (
         <div
           style={{
             position: 'absolute',
-            top: 8,
-            left: 16,
+            top: 6,
+            left: 0,
+            right: 0,
+            textAlign: 'center',
             zIndex: 2,
-            padding: '6px 10px',
-            borderRadius: 8,
-            background: 'rgba(255,255,255,0.85)',
-            border: '1px solid #e5e7eb',
-            fontWeight: 600
+            fontWeight: 600,
+            fontSize: 16,
+            color: '#0f172a',
+            pointerEvents: 'none'
           }}
         >
-          {title}
+          {title.trim()}
         </div>
-      ) : null}
-      <div ref={containerRef} style={{ height: '100%', width: '100%' }} />
+      )}
+      <div
+        ref={ref}
+        style={{
+          width: '100%',
+          height: '100%',
+          border: '1px solid #e5e7eb',
+          overflow: 'hidden',
+          position: 'absolute',
+          inset: 0,
+          background: '#f7f7f7'
+        }}
+      />
     </div>
   )
 }
