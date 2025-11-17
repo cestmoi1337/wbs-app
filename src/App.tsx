@@ -1,9 +1,9 @@
-import { useMemo, useState, useEffect } from 'react'
+// src/App.tsx
+import { useMemo, useRef, useState } from 'react'
 import Diagram, { type LayoutMode, type DiagramApi } from './components/Diagram'
 import { parseOutline, type WbsNode } from './lib/parseOutline'
-import { importOutlineFromFile } from './lib/importers'
+import { importOutlineFromFile } from './lib/importers' // (file: File) => Promise<string>
 
-/** Sample */
 const SAMPLE = `Project
   Initiation
     Develop charter
@@ -22,299 +22,345 @@ const SAMPLE = `Project
     Build Feature C
   Closeout
     Lessons learned 
-    Closing
-`
+    Closing`
+
+type Pos = { x: number; y: number }
+
+// Card helper
+const cardBox: React.CSSProperties = {
+  border: '1px solid #e5e7eb',
+  borderRadius: 16,
+  background: '#fff',
+  boxShadow: '0 10px 30px rgba(0,0,0,0.06)'
+}
+
+const btn: React.CSSProperties = {
+  padding: '6px 10px',
+  borderRadius: 10,
+  border: '1px solid #d1d5db',
+  background: '#ffffff',
+  cursor: 'pointer',
+  fontSize: 12
+}
 
 export default function App() {
-  // LEFT INPUT
-  const [inputText, setInputText] = useState<string>(SAMPLE)
-  const [error, setError] = useState<string | null>(null)
-
-  // TREE
-  const [tree, setTree] = useState<WbsNode>(() => parseOutline(SAMPLE))
-
-  // TITLE
-  const [title, setTitle] = useState<string>('Work Breakdown Structure')
-
-  // LAYOUT & STYLE CONTROLS
+  const [text, setText] = useState<string>(SAMPLE)
   const [layoutMode, setLayoutMode] = useState<LayoutMode>('horizontal')
-  const [fontSize, setFontSize] = useState<number>(14)
-  const [boxWidth, setBoxWidth] = useState<number>(240)
-  const [boxHeight, setBoxHeight] = useState<number>(72)
-  const [textMaxWidth, setTextMaxWidth] = useState<number>(220)
+  const [fontSize, setFontSize] = useState(14)
+  const [boxWidth, setBoxWidth] = useState(300)
+  const [boxHeight, setBoxHeight] = useState(90)
+  const [textMaxWidth, setTextMaxWidth] = useState(280)
+  const [showGrid, setShowGrid] = useState(true)
+  const [gridSize, setGridSize] = useState(10)
+  const [snapToGrid, setSnapToGrid] = useState(true)
+  const [title, setTitle] = useState('')
 
-  // GRID
-  const [showGrid, setShowGrid] = useState<boolean>(true)
-  const [snapToGrid, setSnapToGrid] = useState<boolean>(true)
-  const [gridSize, setGridSize] = useState<number>(10)
+  const [positions, setPositions] = useState<Record<string, Pos>>({})
+  const apiRef = useRef<DiagramApi | null>(null)
 
-  // Diagram API
-  const [diagramApi, setDiagramApi] = useState<DiagramApi | null>(null)
+  const root: WbsNode = useMemo(() => parseOutline(text), [text])
 
-  const onGenerate = () => {
-    try {
-      const t = parseOutline(inputText)
-      setTree(t)
-      // Auto-title from root label
-      const auto = (t.label || 'Work Breakdown Structure').trim()
-      setTitle(auto)
-      setError(null)
-    } catch (e: any) {
-      setError(e?.message || 'Failed to parse outline')
-    }
+  const handleReady = (api: DiagramApi) => {
+    apiRef.current = api
   }
 
-  const onImportClick = async () => {
-    try {
+  // Actions
+  const doFit = () => apiRef.current?.fitToScreen()
+  const doAutoFitAll = () => apiRef.current?.autoFitAll?.()
+  const doUndo = () => apiRef.current?.undo?.()
+  const doRedo = () => apiRef.current?.redo?.()
+
+  const savePNG = () => apiRef.current?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 80 })
+  const saveSVG = () => apiRef.current?.downloadSVG({ margin: 80 })
+  const saveJSON = () => {
+    const json = apiRef.current?.exportJSON()
+    if (!json) return
+    const blob = new Blob([json], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'wbs.json'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  }
+  const printPDF = () => apiRef.current?.print({ bg: '#ffffff', margin: 80 })
+
+  // local file picker
+  const pickFile = () =>
+    new Promise<File | null>((resolve) => {
       const input = document.createElement('input')
       input.type = 'file'
-      input.accept = '.xlsx,.xls,.csv,.tsv,.txt'
-      input.onchange = async () => {
-        const file = input.files?.[0]
-        if (!file) return
-        const text = await importOutlineFromFile(file)
-        setInputText(text)
-        const t = parseOutline(text)
-        setTree(t)
-        // Auto-title on import too
-        const auto = (t.label || 'Work Breakdown Structure').trim()
-        setTitle(auto)
-        setError(null)
-      }
+      input.accept = '.csv,.tsv,.xlsx,.json,.txt'
+      input.onchange = () => resolve(input.files?.[0] ?? null)
       input.click()
-    } catch (e: any) {
-      setError(e?.message || 'Failed to import file')
-    }
-  }
-
-  const handleRename = (id: string, newLabel: string) => {
-    setTree(prev => {
-      const rename = (n: WbsNode): WbsNode =>
-        n.id === id ? { ...n, label: newLabel } : { ...n, children: (n.children || []).map(rename) }
-      return rename(prev)
     })
-  }
 
-  // Keyboard shortcuts: Undo / Redo, routed to Diagram
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (!diagramApi) return
-      const meta = e.metaKey || e.ctrlKey
-      if (!meta) return
-      // Undo: Cmd/Ctrl+Z (no Shift)
-      if (e.key.toLowerCase() === 'z' && !e.shiftKey) {
-        e.preventDefault()
-        diagramApi.undo?.()
-      }
-      // Redo: Cmd/Ctrl+Shift+Z or Cmd/Ctrl+Y
-      if ((e.key.toLowerCase() === 'z' && e.shiftKey) || e.key.toLowerCase() === 'y') {
-        e.preventDefault()
-        diagramApi.redo?.()
-      }
+  const importOutline = async () => {
+    const file = await pickFile()
+    if (!file) return
+    const ext = (file.name.split('.').pop() || '').toLowerCase()
+
+    if (ext === 'json') {
+      const json = await file.text()
+      apiRef.current?.importJSON(json)
+      return
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [diagramApi])
 
-  const renderKey = useMemo(() => `${layoutMode}`, [layoutMode])
+    const outlineText = await importOutlineFromFile(file)
+    if (outlineText && outlineText.trim()) setText(outlineText)
+  }
 
   return (
     <div
       style={{
         height: '100vh',
         width: '100vw',
-        display: 'flex',
-        gap: 12,
-        padding: 12,
-        background: 'var(--bg)',
-        overflow: 'hidden'
+        display: 'grid',
+        gridTemplateColumns: 'minmax(320px, 520px) 1fr',
+        gridTemplateRows: 'auto 1fr',
+        gap: 0,
+        background: '#f3f6fb'
       }}
     >
-      {/* Left column: input card */}
-      <div style={{ width: 420, minWidth: 340, maxWidth: 520, height: '100%' }}>
-        <div className="panel" style={{ height: '100%', display: 'flex', flexDirection: 'column', padding: 12, gap: 12 }}>
-          <div style={{ fontWeight: 600 }}>Project Outline</div>
-
-          <div className="label">Paste an indented outline OR a 2-column (WBS, Name) table:</div>
-          <textarea
-            value={inputText}
-            onChange={e => setInputText(e.target.value)}
-            placeholder={`e.g.\nProject\n  Planning\n    Task A\n    Task B\n\nor CSV/TSV/Excel with columns:\nWBS\tName\n1\tRoot\n1.1\tChild\n1.1.1\tLeaf`}
-            style={{
-              width: '100%',
-              flex: 1,
-              minHeight: 280,
-              resize: 'none',
-              padding: 10,
-              borderRadius: 8,
-              border: '1px solid var(--border)',
-              lineHeight: 1.4
-            }}
-          />
-
-          {error && (
-            <div style={{ color: '#b91c1c', fontSize: 13 }}>
-              {error}
-            </div>
-          )}
-
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button onClick={onGenerate}>Generate</button>
-            <button onClick={onImportClick}>Import Excel/CSV/TSV</button>
+      {/* Toolbar CARD (wraps if narrow) */}
+      <div
+        style={{
+          gridColumn: '1 / -1',
+          position: 'sticky',
+          top: 0,
+          zIndex: 100,
+          padding: 12,
+          background: 'transparent'
+        }}
+      >
+        <div
+          style={{
+            ...cardBox,
+            padding: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            flexWrap: 'wrap',
+            rowGap: 10
+          }}
+        >
+          {/* Title */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <label style={{ fontSize: 12 }}>
+              Title:&nbsp;
+              <input
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="Diagram title"
+                style={{ padding: '6px 8px', border: '1px solid #e5e7eb', borderRadius: 10, width: 220 }}
+              />
+            </label>
           </div>
 
-          <div className="label" style={{ marginTop: 4 }}>
-            Tips: Double-click = auto-fit width. Alt+Double-click = rename. Shift+Double-click = reset width.
+          {/* Layout */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <label style={{ fontSize: 12 }}>
+              Layout:&nbsp;
+              <select
+                value={layoutMode}
+                onChange={(e) => setLayoutMode(e.target.value as LayoutMode)}
+                style={{ padding: '6px 8px', border: '1px solid #e5e7eb', borderRadius: 10 }}
+              >
+                <option value="horizontal">Horizontal</option>
+                <option value="vertical">Vertical</option>
+                <option value="mindmap">Mind map</option>
+              </select>
+            </label>
           </div>
-          <div className="label">
-            Collapse/expand with chevron (+/−) or Cmd/Ctrl+Double-click.  
-            Undo/Redo: Cmd/Ctrl+Z / Cmd/Ctrl+Shift+Z.  
-            Move selected with Arrow keys (Shift for 10×).
+
+          {/* Sliders */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <label style={{ fontSize: 12 }}>
+              Font:&nbsp;
+              <input
+                type="range"
+                min={10}
+                max={48}
+                value={fontSize}
+                onChange={(e) => setFontSize(parseInt(e.target.value))}
+              />
+              &nbsp;{fontSize}px
+            </label>
+            <label style={{ fontSize: 12 }}>
+              Width:&nbsp;
+              <input
+                type="range"
+                min={140}
+                max={720}
+                value={boxWidth}
+                onChange={(e) => setBoxWidth(parseInt(e.target.value))}
+              />
+              &nbsp;{boxWidth}px
+            </label>
+            <label style={{ fontSize: 12 }}>
+              Height:&nbsp;
+              <input
+                type="range"
+                min={40}
+                max={180}
+                value={boxHeight}
+                onChange={(e) => setBoxHeight(parseInt(e.target.value))}
+              />
+              &nbsp;{boxHeight}px
+            </label>
+            <label style={{ fontSize: 12 }}>
+              Wrap:&nbsp;
+              <input
+                type="range"
+                min={120}
+                max={720}
+                value={textMaxWidth}
+                onChange={(e) => setTextMaxWidth(parseInt(e.target.value))}
+              />
+              &nbsp;{textMaxWidth}px
+            </label>
+          </div>
+
+          {/* Actions */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button onClick={doFit} style={btn}>Fit</button>
+            <button onClick={doAutoFitAll} style={btn}>Auto-fit text</button>
+            <button onClick={doUndo} style={btn}>Undo</button>
+            <button onClick={doRedo} style={btn}>Redo</button>
+          </div>
+
+          {/* Export */}
+          <div style={{ display: 'flex', alignItems: 'center' }}>
+            <details style={{ position: 'relative' }}>
+              <summary style={{ ...btn, listStyle: 'none', cursor: 'pointer' }}>▼ Export</summary>
+              <div
+                style={{
+                  position: 'absolute',
+                  top: '110%',
+                  right: 0,
+                  left: 'auto',
+                  display: 'flex',
+                  gap: 6,
+                  padding: 8,
+                  border: '1px solid #e5e7eb',
+                  borderRadius: 10,
+                  background: '#fff',
+                  boxShadow: '0 10px 30px rgba(0,0,0,0.12)',
+                  zIndex: 120,
+                  whiteSpace: 'nowrap',
+                  maxWidth: 'calc(100vw - 24px)',  // <-- never exceed viewport
+                  flexWrap: 'wrap'
+                }}
+              >
+                <button onClick={savePNG} style={btn}>PNG</button>
+                <button onClick={saveSVG} style={btn}>SVG</button>
+                <button onClick={saveJSON} style={btn}>JSON</button>
+                <button onClick={printPDF} style={btn}>Print / PDF</button>
+              </div>
+            </details>
+          </div>
+
+          {/* Grid/Snap + Import */}
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <label style={{ fontSize: 12 }}>
+              <input
+                type="checkbox"
+                checked={showGrid}
+                onChange={(e) => setShowGrid(e.target.checked)}
+              />{' '}
+              Grid
+            </label>
+            <label style={{ fontSize: 12 }}>
+              <input
+                type="checkbox"
+                checked={snapToGrid}
+                onChange={(e) => setSnapToGrid(e.target.checked)}
+              />{' '}
+              Snap
+            </label>
+            <label style={{ fontSize: 12 }}>
+              Grid:&nbsp;
+              <input
+                type="number"
+                min={4}
+                max={40}
+                value={gridSize}
+                onChange={(e) => setGridSize(parseInt(e.target.value || '10', 10))}
+                style={{ width: 60, padding: '6px 8px', border: '1px solid #e5e7eb', borderRadius: 10 }}
+              />
+              &nbsp;px
+            </label>
+
+            <button
+              onClick={importOutline}
+              style={{ ...btn, background: '#f1f5f9', border: '1px solid #e5e7eb' }}
+              title="Import CSV / TSV / XLSX / JSON"
+            >
+              Import CSV/TSV/XLSX/JSON
+            </button>
           </div>
         </div>
       </div>
 
-      {/* Right side */}
-      <div style={{ flex: 1, height: '100%', display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0 }}>
-        {/* Toolbar */}
-        <div className="panel" style={{ padding: 10, display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-          {/* Title */}
-          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            Title:&nbsp;
-            <input
-              type="text"
-              value={title}
-              onChange={e => setTitle(e.target.value)}
-              style={{ padding: 6, borderRadius: 8, border: '1px solid var(--border)', minWidth: 240 }}
-              placeholder="Work Breakdown Structure"
-            />
-          </label>
-
-          {/* Layout */}
-          <label className="label">
-            Layout:&nbsp;
-            <select
-              value={layoutMode}
-              onChange={e => setLayoutMode(e.target.value as LayoutMode)}
-            >
-              <option value="horizontal">Horizontal (Left→Right)</option>
-              <option value="vertical">Vertical (Top→Down)</option>
-              <option value="mindmap">Mind map (Radial)</option>
-            </select>
-          </label>
-
-          {/* Font size */}
-          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            Font:&nbsp;{fontSize}px
-            <input
-              type="range"
-              min={10}
-              max={48}
-              step={1}
-              value={fontSize}
-              onChange={e => setFontSize(parseInt(e.target.value))}
-            />
-          </label>
-
-          {/* Box width */}
-          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            Box W:&nbsp;{boxWidth}px
-            <input
-              type="range"
-              min={140}
-              max={420}
-              step={10}
-              value={boxWidth}
-              onChange={e => setBoxWidth(parseInt(e.target.value))}
-            />
-          </label>
-
-          {/* Box height */}
-          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            Box H:&nbsp;{boxHeight}px
-            <input
-              type="range"
-              min={44}
-              max={180}
-              step={4}
-              value={boxHeight}
-              onChange={e => setBoxHeight(parseInt(e.target.value))}
-            />
-          </label>
-
-          {/* Text wrap width */}
-          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            Wrap:&nbsp;{textMaxWidth}px
-            <input
-              type="range"
-              min={120}
-              max={400}
-              step={10}
-              value={textMaxWidth}
-              onChange={e => setTextMaxWidth(parseInt(e.target.value))}
-            />
-          </label>
-
-          {/* Grid */}
-          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <input
-              type="checkbox"
-              checked={showGrid}
-              onChange={e => setShowGrid(e.target.checked)}
-            />
-            Show grid
-          </label>
-
-          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <input
-              type="checkbox"
-              checked={snapToGrid}
-              onChange={e => setSnapToGrid(e.target.checked)}
-            />
-            Snap to grid
-          </label>
-
-          <label className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            Grid:&nbsp;{gridSize}px
-            <input
-              type="range"
-              min={5}
-              max={40}
-              step={1}
-              value={gridSize}
-              onChange={e => setGridSize(parseInt(e.target.value))}
-            />
-          </label>
-
-          {/* Actions right side */}
-          <div style={{ flex: 1 }} />
-          <button onClick={() => diagramApi?.autoFitAll?.()}>Auto-fit all</button>
-          <button onClick={() => diagramApi?.fitToScreen()}>Fit</button>
-          <button onClick={() => diagramApi?.downloadPNG({ scale: 2, bg: '#ffffff', margin: 120 })}>PNG</button>
-          <button onClick={() => diagramApi?.downloadSVG({ margin: 120 /* transparent */ })}>SVG</button>
-          <button onClick={() => diagramApi?.undo?.()}>Undo</button>
-          <button onClick={() => diagramApi?.redo?.()}>Redo</button>
-        </div>
-
-        {/* Diagram card */}
-        <div className="panel" style={{ flex: 1, padding: 10, minHeight: 0 }}>
-          <div style={{ width: '100%', height: '100%' }}>
-            <Diagram
-              key={renderKey}
-              title={title}
-              root={tree}
-              onRename={handleRename}
-              onReady={setDiagramApi}
-              fontSize={fontSize}
-              boxWidth={boxWidth}
-              boxHeight={boxHeight}
-              textMaxWidth={textMaxWidth}
-              layoutMode={layoutMode}
-              showGrid={showGrid}
-              gridSize={gridSize}
-              snapToGrid={snapToGrid}
+      {/* Left pane (card) */}
+      <div style={{ borderRight: '1px solid #e5e7eb', overflow: 'auto', background: '#f3f6fb' }}>
+        <div style={{ padding: 16 }}>
+          <div style={{ ...cardBox, padding: 12 }}>
+            <p style={{ fontSize: 12, color: '#475569', margin: '6px 0 8px' }}>
+              Paste a WBS outline here (indented or two-column WBS).
+              <span style={{ color: '#64748b' }}> Double-click a box in the diagram to auto-fit text.</span>
+            </p>
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              spellCheck={false}
+              style={{
+                width: '100%',
+                height: 'calc(100vh - 190px)',
+                resize: 'none',
+                fontFamily:
+                  'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace',
+                fontSize: 13,
+                lineHeight: 1.5,
+                border: '1px solid #e5e7eb',
+                borderRadius: 10,
+                padding: 12
+              }}
             />
           </div>
+        </div>
+      </div>
+
+      {/* Right pane: DIAGRAM CARD */}
+      <div style={{ padding: 16, background: '#f3f6fb' }}>
+        <div
+          style={{
+            ...cardBox,
+            position: 'relative',
+            height: '100%',
+            width: '100%',
+            overflow: 'hidden' // keep canvas clipped to rounded corners
+          }}
+        >
+          <Diagram
+            key={layoutMode}
+            root={root}
+            title={title}
+            initialPositions={positions}
+            onPositionsChange={setPositions}
+            onReady={handleReady}
+            fontSize={fontSize}
+            boxWidth={boxWidth}
+            boxHeight={boxHeight}
+            textMaxWidth={textMaxWidth}
+            layoutMode={layoutMode}
+            showGrid={showGrid}
+            gridSize={gridSize}
+            snapToGrid={snapToGrid}
+            onRename={() => {}}
+          />
         </div>
       </div>
     </div>
